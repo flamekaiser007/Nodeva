@@ -77,3 +77,27 @@ test('empty pool returns empty, never a fallback suggestion', () => {
   // Never falsely show availability (design principle 14).
   assert.deepEqual(rank([], req), []);
 });
+
+test('a new/unproven provider is flagged for verification on its search result', () => {
+  const newProvider = { ...A, id: 'new', rep_jobs_total: 0 };
+  const result = rank([newProvider], req)[0];
+  assert.equal(result.verification_recommended, true);
+  assert.ok(result.verification_reasons.includes('new_provider'));
+});
+
+test('an established, reliable provider on an ordinary-priced job is not flagged', () => {
+  const established = { ...A, id: 'established', rep_jobs_total: 500, reliability: 0.99 };
+  const result = rank([established], req)[0];
+  assert.equal(result.verification_recommended, false);
+  assert.deepEqual(result.verification_reasons, []);
+});
+
+test('the recommendation is per-candidate, not a single value applied to the whole list', () => {
+  const trusted = { ...A, id: 'trusted', rep_jobs_total: 500, reliability: 0.99 };
+  const newOne = { ...B, id: 'newOne', rep_jobs_total: 0,
+                   availability: [{ start: T('09:00'), end: T('14:00') }] };
+  const results = rank([trusted, newOne], req);
+  const byId = Object.fromEntries(results.map((r) => [r.node.id, r]));
+  assert.equal(byId.trusted.verification_recommended, false);
+  assert.equal(byId.newOne.verification_recommended, true);
+});

@@ -57,6 +57,12 @@ export async function searchCandidates(pool, hub, req) {
       reliability: r.rep_jobs_total > 0
         ? 1 - r.rep_jobs_failed / r.rep_jobs_total
         : 0.8,
+      // Kept alongside the derived reliability score (not folded into it)
+      // because scheduler.js's shouldRecommendVerification needs to tell
+      // "zero jobs" apart from "jobs whose reliability happens to compute
+      // to the same neutral default" -- reliability alone can't distinguish
+      // those two cases.
+      rep_jobs_total: r.rep_jobs_total,
       latency_ms: 50, // placeholder until real RTT measurement lands (Phase 2)
       availability: windowsByNode.get(r.node_id) ?? [],
     }));

@@ -225,11 +225,31 @@ Phase 1, early. What exists and is tested:
   states are legal" that had drifted from `machine.js`'s own list --
   adding `DISPUTED` to one without the other meant every dispute attempt
   failed with a constraint violation the first time it actually ran.
+- `shouldRecommendVerification` (`jobs/verification.js`, wired into
+  `scheduler.rank()`) — closes half of the previous commit's own named
+  gap: search results now flag a node as worth verifying (new/unproven
+  provider, below-threshold measured reliability, or a high-value booking
+  -- the master brief's own "new providers, suspicious providers,
+  high-value jobs" list), with the specific reason(s) shown, not just an
+  unexplained badge. Deliberately a *recommendation surfaced to the user*,
+  never an automatic second booking -- silently doubling someone's charge
+  without consent would be worse than not verifying at all, exactly the
+  same opt-in principle `verify_against_reservation_id` itself follows.
+  Caught live, not by the unit tests first: a freshly enrolled node with
+  zero jobs showed up flagged as *both* "new provider" and "below-average
+  reliability" simultaneously, because a brand-new node's reliability is
+  `nodeStore.js`'s neutral 0.8 default -- a placeholder meaning "no opinion
+  yet," not a real measurement -- which happens to sit below the
+  low-reliability threshold. The original unit test fixture used
+  `reliability: 1` and never exercised this, which is exactly why it took
+  a real browser check to surface it. Fixed so low_reliability is only
+  ever evaluated for a provider with an actual track record, and a
+  regression test now pins the realistic (0.8-default) case the first
+  fixture missed.
 
-Not built yet: P2P discovery beyond one platform-worker link, a policy that
-decides *automatically* which jobs warrant duplicate-execution
-verification, and a real dispute-resolution process that can attribute
-fault beyond "at least one of these two nodes is wrong."
+Not built yet: P2P discovery beyond one platform-worker link, and a real
+dispute-resolution process that can attribute fault beyond "at least one
+of these two nodes is wrong" (a third-node majority vote, say).
 
 ## Running
 
@@ -240,7 +260,7 @@ for f in backend/migrations/*.sql; do
   docker compose exec -T postgres psql -U nodeva -d nodeva < "$f"
 done
 
-# backend tests (161) -- JWT_SECRET only needed by tests that build the full
+# backend tests (172) -- JWT_SECRET only needed by tests that build the full
 # app (server.js); the unit test files don't call createApp() so most pass
 # without it, but set it anyway to be safe. Several suites (reconciler,
 # reputation-integration, dashboard, payment-flow, account-recovery)

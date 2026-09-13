@@ -12,6 +12,8 @@
 // "score lower" for a job needing 20GB — it cannot run it at all. Hard-filter
 // first, then rank only what is feasible.
 
+import { shouldRecommendVerification } from '../jobs/verification.js';
+
 export const MODES = {
   // Weights sum to 1 within each mode. Tuned by hand for the MVP; these are
   // exactly the parameters the scheduling evaluation is meant to learn.
@@ -76,12 +78,22 @@ export function rank(nodes, req, mode = 'best_value') {
   const nLat  = normalize(pool.map(n => n.latency_ms ?? 0), true);
 
   return pool
-    .map((n, i) => ({
-      node: n,
-      score: w.cost * nCost[i] + w.perf * nPerf[i]
-           + w.reliability * nRel[i] + w.latency * nLat[i],
-      quoted_paise: Math.ceil(n.price_paise_hr * hours),
-      expected_cost_paise: Math.round(expectedCostPaise(n, hours)),
-    }))
+    .map((n, i) => {
+      const quoted_paise = Math.ceil(n.price_paise_hr * hours);
+      // Recommending, never auto-booking: see jobs/verification.js's file
+      // header for why silently doubling a booking (and the charge) without
+      // the user's say-so would be worse than not verifying at all.
+      const verification = shouldRecommendVerification(
+        { repJobsTotal: n.rep_jobs_total, reliability: n.reliability }, quoted_paise);
+      return {
+        node: n,
+        score: w.cost * nCost[i] + w.perf * nPerf[i]
+             + w.reliability * nRel[i] + w.latency * nLat[i],
+        quoted_paise,
+        expected_cost_paise: Math.round(expectedCostPaise(n, hours)),
+        verification_recommended: verification.recommended,
+        verification_reasons: verification.reasons,
+      };
+    })
     .sort((a, b) => b.score - a.score);
 }

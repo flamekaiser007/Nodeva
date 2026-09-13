@@ -1,3 +1,9 @@
+const VERIFICATION_REASON_LABEL = {
+  new_provider: 'new provider',
+  low_reliability: 'below-average reliability',
+  high_value_job: 'higher-value booking',
+}
+
 // Renders scheduler.js's ranked output. `score` and `expected_cost_paise`
 // are shown so the ranking is legible, not a black box -- a user should be
 // able to see WHY the top result is the top result.
@@ -37,6 +43,15 @@ export default function ResultsList({ results, onReserve, reservingId }) {
               reliability {(r.node.reliability * 100).toFixed(0)}% · score {r.score.toFixed(2)} ·
               {' '}expected cost ₹{(r.expected_cost_paise / 100).toFixed(2)}
             </div>
+            {r.verification_recommended && (
+              <div className="mt-1.5 inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs text-amber-700"
+                title="This platform can run your job on two independent nodes and compare results -- ask for it when submitting a job.">
+                🔍 verification suggested
+                <span className="text-amber-500">
+                  ({r.verification_reasons.map((x) => VERIFICATION_REASON_LABEL[x] ?? x).join(', ')})
+                </span>
+              </div>
+            )}
           </div>
           <div className="text-right">
             <div className="text-lg font-semibold text-neutral-800">

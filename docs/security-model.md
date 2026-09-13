@@ -80,12 +80,16 @@ State the limits precisely, because they are easy to overstate:
   malicious nodes pass cleanly. This raises the cost of cheating
   (compromise or collude with two independent operators, not one) — it does
   not eliminate it.
-- **It is opt-in and manual**, not automatic. Nothing decides *for* the
-  user that a job is valuable enough, or a provider untrusted enough, to
-  warrant paying for two nodes instead of one — a policy that triggers this
-  automatically (new providers, high-value jobs) is exactly the "provider
-  reputation" and "selective" parts of the master brief's answer that
-  remain unbuilt.
+- **Triggering is opt-in and manual; recommending is not.**
+  `shouldRecommendVerification` (`jobs/verification.js`, surfaced on every
+  search result via `scheduler.rank()`) does flag new/unproven providers,
+  below-threshold measured reliability, and high-value bookings
+  automatically — the master brief's own "selective" criteria. But it only
+  ever *recommends*: nothing books a second reservation or doubles a
+  charge without the user explicitly asking for it via
+  `verify_against_reservation_id`. Silently spending someone's money on
+  their behalf would be worse than not verifying at all, so the line is
+  drawn at "tell them," not "decide for them."
 - **It doubles cost and still doesn't cover reading.** A malicious node can
   still read a user's code and input data even if verification later
   catches it lying about the output — nothing here is confidentiality.

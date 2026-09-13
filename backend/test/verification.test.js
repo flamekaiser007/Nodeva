@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { computeResultHash, compareJobResults, groupIsComplete } from '../src/jobs/verification.js';
+import {
+  computeResultHash, compareJobResults, groupIsComplete, shouldRecommendVerification,
+} from '../src/jobs/verification.js';
 
 test('two identical results hash identically', () => {
   const a = computeResultHash({ status: 'succeeded', exit_code: 0, stdout: 'hello\n', stderr: '' });
@@ -70,4 +72,82 @@ test('a group with fewer than two jobs is never complete, regardless of status',
   const terminal = new Set(['succeeded']);
   assert.equal(groupIsComplete([{ status: 'succeeded' }], terminal), false);
   assert.equal(groupIsComplete([], terminal), false);
+});
+
+// --- shouldRecommendVerification -------------------------------------------
+
+test('a brand-new provider (zero jobs) is recommended for verification', () => {
+  const { recommended, reasons } = shouldRecommendVerification(
+    { repJobsTotal: 0, reliability: 1 }, 4300);
+  assert.equal(recommended, true);
+  assert.ok(reasons.includes('new_provider'));
+});
+
+test('a brand-new provider is NOT also flagged low_reliability from the neutral default alone', () => {
+  // The real bug, caught live in the browser, not by this suite first: a
+  // freshly enrolled node has no track record, so nodeStore.js gives it a
+  // neutral DEFAULT reliability of 0.8 -- a "no opinion yet" placeholder,
+  // not a measurement. 0.8 happens to sit below LOW_RELIABILITY_THRESHOLD
+  // (0.9), so checking it unconditionally flagged every brand-new provider
+  // as ALSO "low_reliability", double-counting one signal ("we don't know
+  // yet") as if it were a second, different one ("we know, and it's bad").
+  const { reasons } = shouldRecommendVerification(
+    { repJobsTotal: 0, reliability: 0.8 }, 4300);
+  assert.deepEqual(reasons, ['new_provider'],
+    'the neutral default must not also trigger low_reliability');
+});
+
+test('an established, reliable provider on a cheap job is NOT recommended', () => {
+  const { recommended, reasons } = shouldRecommendVerification(
+    { repJobsTotal: 500, reliability: 0.99 }, 4300);
+  assert.equal(recommended, false);
+  assert.deepEqual(reasons, []);
+});
+
+test('low reliability is flagged even for an established provider', () => {
+  const { recommended, reasons } = shouldRecommendVerification(
+    { repJobsTotal: 500, reliability: 0.7 }, 4300);
+  assert.equal(recommended, true);
+  assert.deepEqual(reasons, ['low_reliability']);
+});
+
+test('a high-value booking is flagged even for a trusted provider', () => {
+  const { recommended, reasons } = shouldRecommendVerification(
+    { repJobsTotal: 500, reliability: 0.99 }, 50_000);
+  assert.equal(recommended, true);
+  assert.deepEqual(reasons, ['high_value_job']);
+});
+
+test('multiple reasons can apply at once, and all are reported', () => {
+  // An ESTABLISHED provider (repJobsTotal well past the new-provider
+  // threshold) with a genuinely measured bad reliability, on a high-value
+  // job -- unlike a brand-new provider, low_reliability here reflects a
+  // real track record, not the neutral "no opinion yet" default, so it
+  // correctly applies alongside high_value_job.
+  const { recommended, reasons } = shouldRecommendVerification(
+    { repJobsTotal: 200, reliability: 0.5 }, 50_000);
+  assert.equal(recommended, true);
+  assert.deepEqual(reasons.sort(), ['high_value_job', 'low_reliability']);
+});
+
+test('new_provider and low_reliability are mutually exclusive by construction', () => {
+  // A provider is either too new to have a meaningful reliability score, or
+  // established enough that its score means something -- never both
+  // reasons on the same node, which would double-count one underlying
+  // signal ("we don't have enough data") as two.
+  for (const repJobsTotal of [0, 1, 4]) {
+    const { reasons } = shouldRecommendVerification({ repJobsTotal, reliability: 0.1 }, 100);
+    assert.ok(!reasons.includes('low_reliability'), `repJobsTotal=${repJobsTotal} is still "new"`);
+  }
+  const established = shouldRecommendVerification({ repJobsTotal: 5, reliability: 0.1 }, 100);
+  assert.ok(established.reasons.includes('low_reliability'), 'repJobsTotal=5 has crossed into "established"');
+});
+
+test('missing reliability/repJobsTotal fields do not crash and default sensibly', () => {
+  // A defensive check, not an expected real input -- searchCandidates
+  // always supplies both -- but a policy function should not throw on
+  // partial data, it should degrade to its safest assumption.
+  assert.doesNotThrow(() => shouldRecommendVerification({}, 4300));
+  const { reasons } = shouldRecommendVerification({}, 100);
+  assert.ok(reasons.includes('new_provider'), 'missing repJobsTotal must not be treated as proven');
 });
