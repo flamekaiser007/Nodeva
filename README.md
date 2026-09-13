@@ -43,13 +43,29 @@ Phase 1, early. What exists and is tested:
   reliability-adjusted ranking.
 - `backend/src/payments/settle.js` — exact 90/10 split, pro-rata quoting,
   metered billing for user-caused failures.
+- `worker/nodeva_worker/reservations.py` — the node-side authoritative lock.
+  32 threads racing for one slot elect exactly one winner.
+- `worker/nodeva_worker/identity.py` — Ed25519 node identity; receipts signed
+  here verify in the backend, proven by a cross-language test.
+- `worker/nodeva_worker/hardware.py` — GPU detection, advertising only VRAM
+  that is actually free.
 
-Not built yet: HTTP API, worker, frontend, P2P.
+Not built yet: HTTP API, job execution/sandboxing, frontend, P2P.
 
 ## Running
 
 ```bash
+# schema
 docker compose up -d postgres
 docker compose exec -T postgres psql -U nodeva -d nodeva < backend/migrations/001_init.sql
-cd backend && npm test
+
+# backend tests (33)
+cd backend && node --test test/*.test.js
+
+# worker tests (20)
+python3 -m venv .venv && .venv/bin/pip install -r worker/requirements-dev.txt
+.venv/bin/python -m pytest worker/tests -q
 ```
+
+The signature fixtures shared by both suites are regenerated with
+`.venv/bin/python worker/tools/gen_interop_fixture.py`.

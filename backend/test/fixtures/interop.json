@@ -1,0 +1,41 @@
+{
+  "public_key_hex": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8",
+  "cases": [
+    {
+      "name": "reservation_receipt",
+      "body": {
+        "reservation_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "node_id": "44444444-4444-4444-4444-444444444444",
+        "starts_at": 1789000000000,
+        "ends_at": 1789003600000,
+        "price_paise_hr": 4300,
+        "hold_expires_at": 1789000120000,
+        "issued_at": 1789000000000
+      },
+      "canonical": "{\"ends_at\":1789003600000,\"hold_expires_at\":1789000120000,\"issued_at\":1789000000000,\"node_id\":\"44444444-4444-4444-4444-444444444444\",\"price_paise_hr\":4300,\"reservation_id\":\"7c9e6679-7425-40de-944b-e07fc1f90ae7\",\"starts_at\":1789000000000}",
+      "signature_hex": "041be58dcbdea8f04e95b8070a40b44ee3731add5d7c1209f7ceeb6978ec7a7fa4ecd4f09399c7b069f26e766b1292d238b5b8ede099ded4134062e44bfa0f05"
+    },
+    {
+      "name": "unicode_and_ordering",
+      "body": {
+        "z_last": 1,
+        "a_first": "ok",
+        "unicode": "प्रदाता ₹43 — naïve",
+        "nested": {
+          "b": [
+            1,
+            2,
+            {
+              "d": false,
+              "c": null
+            }
+          ],
+          "a": true
+        },
+        "big_int": 9007199254740991
+      },
+      "canonical": "{\"a_first\":\"ok\",\"big_int\":9007199254740991,\"nested\":{\"a\":true,\"b\":[1,2,{\"c\":null,\"d\":false}]},\"unicode\":\"प्रदाता ₹43 — naïve\",\"z_last\":1}",
+      "signature_hex": "fb738c53f98d47fb5caf5583ab996952115e3ea6d12babe4f6fe03e5bdc497ef1ecfddd87263388cba46f10b1da17e445f0bf918919f1d7b6fbe4f0e8e25da0b"
+    }
+  ]
+}
