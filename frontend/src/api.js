@@ -62,6 +62,18 @@ export const api = {
     }),
 
   getJob: (jobId) => request(`/jobs/${jobId}`),
+
+  // --- provider --------------------------------------------------------
+  becomeProvider: () => request('/providers/me', { method: 'POST' }),
+
+  providerDashboard: () => request('/providers/me/dashboard'),
+
+  enrollNode: (node) => request('/nodes', { method: 'POST', body: JSON.stringify(node) }),
+
+  addAvailability: (nodeId, window_start, window_end) =>
+    request(`/nodes/${nodeId}/availability`, {
+      method: 'POST', body: JSON.stringify({ window_start, window_end }),
+    }),
 }
 
 export { ApiError }

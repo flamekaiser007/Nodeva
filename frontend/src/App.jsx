@@ -4,6 +4,7 @@ import UserBar from './components/UserBar'
 import SearchForm from './components/SearchForm'
 import ResultsList from './components/ResultsList'
 import ActiveReservation from './components/ActiveReservation'
+import ProviderDashboard from './components/ProviderDashboard'
 
 const STORAGE_KEY = 'nodeva_session' // { token, user }
 
@@ -15,6 +16,9 @@ export default function App() {
       return saved
     } catch { return null }
   })
+  // One account, two roles (master design: "a user can potentially also
+  // become a provider") -- this is a view toggle, not a different login.
+  const [mode, setMode] = useState('rent') // 'rent' | 'share'
   const [lastQuery, setLastQuery] = useState(null)
   const [results, setResults] = useState(null)
   const [searching, setSearching] = useState(false)
@@ -86,12 +90,21 @@ export default function App() {
 
       <UserBar user={session?.user} onAuth={handleAuth} />
 
+      {session && (
+        <div className="mx-auto flex max-w-3xl gap-2 px-4 pt-4">
+          <ModeTab active={mode === 'rent'} onClick={() => setMode('rent')}>Rent GPU</ModeTab>
+          <ModeTab active={mode === 'share'} onClick={() => setMode('share')}>Share GPU</ModeTab>
+        </div>
+      )}
+
       <main className="mx-auto max-w-3xl space-y-6 p-4">
         {error && (
           <div className="rounded bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
         )}
 
-        {reservation ? (
+        {mode === 'share' && session ? (
+          <ProviderDashboard />
+        ) : reservation ? (
           <ActiveReservation
             reservation={reservation}
             onSettled={() => { setReservation(null); handleSearch(lastQuery) }}
@@ -104,5 +117,16 @@ export default function App() {
         )}
       </main>
     </div>
+  )
+}
+
+function ModeTab({ active, onClick, children }) {
+  return (
+    <button onClick={onClick}
+      className={`rounded-t-lg px-4 py-2 text-sm font-medium ${
+        active ? 'bg-white text-neutral-800' : 'bg-neutral-200 text-neutral-500 hover:text-neutral-700'
+      }`}>
+      {children}
+    </button>
   )
 }

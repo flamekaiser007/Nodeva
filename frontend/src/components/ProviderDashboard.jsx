@@ -1,0 +1,243 @@
+import { useEffect, useState } from 'react'
+import { api } from '../api'
+
+function paise(p) { return `₹${(p / 100).toFixed(2)}` }
+
+// Mirrors GET /providers/me/dashboard exactly -- one fetch, one render.
+// Node enrollment here only accepts a PUBLIC key: the private key is
+// generated and stays on the provider's own machine by the Compute Worker
+// (worker/nodeva_worker/identity.py), never typed into a browser. This
+// dashboard is the provider's view of what their worker(s) report, not a
+// way to create or hold key material.
+export default function ProviderDashboard() {
+  const [dashboard, setDashboard] = useState(null)
+  const [needsProvider, setNeedsProvider] = useState(false)
+  const [error, setError] = useState(null)
+  const [becoming, setBecoming] = useState(false)
+  const [showEnroll, setShowEnroll] = useState(false)
+
+  async function load() {
+    try {
+      setDashboard(await api.providerDashboard())
+      setNeedsProvider(false)
+    } catch (e) {
+      if (e.status === 404) setNeedsProvider(true)
+      else setError(e.message)
+    }
+  }
+
+  useEffect(() => {
+    // This IS the standard fetch-on-mount-and-poll shape (React's own docs
+    // use this exact pattern for an effect synchronizing with a remote data
+    // source) -- load()'s eventual setState is not a cascading-render bug,
+    // it's the effect doing its job. The disable comment must sit directly
+    // above the call itself; placed above trailing explanatory comments
+    // instead, it silences the wrong line and does nothing (caught by
+    // re-running the linter after adding it the first time).
+    // eslint-disable-next-line react/set-state-in-effect
+    load()
+    // Heartbeats land every 15s; refresh often enough that "live" GPU
+    // utilization actually looks live, not so often it hammers the API.
+    const id = setInterval(load, 5000)
+    return () => clearInterval(id)
+  }, [])
+
+  async function handleBecomeProvider() {
+    setBecoming(true); setError(null)
+    try {
+      await api.becomeProvider()
+      await load()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBecoming(false)
+    }
+  }
+
+  if (error) {
+    return <div className="rounded bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
+  }
+
+  if (needsProvider) {
+    return (
+      <div className="rounded-lg border border-neutral-200 bg-white p-6 text-center">
+        <p className="mb-3 text-neutral-600">
+          You're not sharing compute yet. One account, two roles -- becoming a
+          provider doesn't change how you rent GPUs.
+        </p>
+        <button onClick={handleBecomeProvider} disabled={becoming}
+          className="rounded bg-emerald-700 px-4 py-2 font-medium text-white hover:bg-emerald-800 disabled:opacity-50">
+          {becoming ? 'Setting up…' : 'Share your GPU'}
+        </button>
+      </div>
+    )
+  }
+
+  if (!dashboard) return <div className="text-neutral-500">Loading…</div>
+
+  const { reputation, earnings, nodes } = dashboard
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Stat label="Today" value={paise(earnings.today_paise)} />
+        <Stat label="This week" value={paise(earnings.week_paise)} />
+        <Stat label="This month" value={paise(earnings.month_paise)} />
+        <Stat label="All time" value={paise(earnings.available_paise)} />
+      </div>
+
+      <div className="rounded-lg border border-neutral-200 bg-white p-4">
+        <div className="flex items-center justify-between text-sm">
+          <span className="font-medium text-neutral-700">Reputation</span>
+          <span className="text-neutral-500">
+            {reputation.jobs_total} jobs
+            {reputation.reliability !== null && (
+              <> · {(reputation.reliability * 100).toFixed(0)}% reliable</>
+            )}
+          </span>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between">
+        <h3 className="font-semibold text-neutral-800">My Machines</h3>
+        <button onClick={() => setShowEnroll((s) => !s)}
+          className="text-sm text-emerald-700 hover:underline">
+          {showEnroll ? 'cancel' : '+ enroll a node'}
+        </button>
+      </div>
+
+      {showEnroll && <EnrollNodeForm onEnrolled={() => { setShowEnroll(false); load() }} />}
+
+      {nodes.length === 0 && !showEnroll && (
+        <div className="rounded-lg border border-dashed border-neutral-300 bg-neutral-50 p-6 text-center text-neutral-500">
+          No machines enrolled yet.
+        </div>
+      )}
+
+      <div className="grid gap-3">
+        {nodes.map((n) => <NodeCard key={n.node_id} node={n} />)}
+      </div>
+    </div>
+  )
+}
+
+function Stat({ label, value }) {
+  return (
+    <div className="rounded-lg border border-neutral-200 bg-white p-3 text-center">
+      <div className="text-xs text-neutral-500">{label}</div>
+      <div className="text-lg font-semibold text-neutral-800">{value}</div>
+    </div>
+  )
+}
+
+function NodeCard({ node }) {
+  const gpu = node.heartbeat?.gpu
+  return (
+    <div className="rounded-lg border border-neutral-200 bg-white p-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className={`h-2 w-2 rounded-full ${node.online ? 'bg-emerald-500' : 'bg-neutral-300'}`} />
+          <span className="font-semibold text-neutral-800">{node.gpu_model}</span>
+        </div>
+        <span className="text-sm text-neutral-500">{node.online ? 'ONLINE' : 'OFFLINE'}</span>
+      </div>
+      <div className="mt-1 text-sm text-neutral-500">
+        {(node.gpu_vram_mb / 1024).toFixed(0)} GB VRAM · {node.cpu_cores} cores ·{' '}
+        {(node.ram_mb / 1024).toFixed(0)} GB RAM · {paise(node.price_paise_hr)}/hr
+      </div>
+      {gpu ? (
+        <div className="mt-2 flex gap-4 text-xs text-neutral-500">
+          <span>GPU util: {gpu.utilization_pct ?? '—'}%</span>
+          <span>Free VRAM: {gpu.vram_free_mb != null ? `${(gpu.vram_free_mb / 1024).toFixed(1)} GB` : '—'}</span>
+          <span>Temp: {gpu.temperature_c ?? '—'}°C</span>
+        </div>
+      ) : node.heartbeat ? (
+        // A heartbeat DID arrive -- confirmed against the real API response
+        // (age_ms present, non-null) -- but its `gpu` field is null, which
+        // is the correct, expected shape for a CPU-only worker or one where
+        // nvidia-smi found nothing (see worker/nodeva_worker/hardware.py's
+        // NoGpu path). Showing "waiting for first heartbeat" here would have
+        // been permanently wrong for any such node -- it already reported in,
+        // it just has no GPU to report on.
+        <div className="mt-2 text-xs text-neutral-400">
+          CPU-only node · {node.heartbeat.live_reservations ?? 0} active reservation(s)
+        </div>
+      ) : node.online ? (
+        <div className="mt-2 text-xs text-neutral-400">waiting for first heartbeat…</div>
+      ) : null}
+    </div>
+  )
+}
+
+function EnrollNodeForm({ onEnrolled }) {
+  const [pubKey, setPubKey] = useState('')
+  const [gpuModel, setGpuModel] = useState('RTX 4090')
+  const [vram, setVram] = useState(24)
+  const [cores, setCores] = useState(16)
+  const [ram, setRam] = useState(32)
+  const [price, setPrice] = useState(43)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+
+  async function submit(e) {
+    e.preventDefault()
+    setBusy(true); setError(null)
+    try {
+      await api.enrollNode({
+        public_key_hex: pubKey.trim(),
+        gpu_model: gpuModel,
+        gpu_vram_mb: vram * 1024,
+        cpu_cores: cores,
+        ram_mb: ram * 1024,
+        price_paise_hr: Math.round(price * 100),
+      })
+      onEnrolled()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="grid gap-3 rounded-lg border border-neutral-200 bg-white p-4">
+      <p className="text-xs text-neutral-500">
+        Run the Compute Worker on the machine you're sharing and paste its public
+        key below (the worker generates and keeps the private key -- it never
+        leaves that machine):
+      </p>
+      <pre className="overflow-x-auto rounded bg-neutral-900 p-2 text-xs text-neutral-100">
+{`python -c "
+from pathlib import Path
+from nodeva_worker.identity import NodeIdentity
+print(NodeIdentity.load_or_create(Path('~/.nodeva/node.pem')).public_key_raw().hex())
+"`}
+      </pre>
+      <input required placeholder="public key (64 hex characters)" value={pubKey}
+        onChange={(e) => setPubKey(e.target.value)}
+        className="rounded border border-neutral-300 px-2 py-1 font-mono text-sm" />
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <LabeledInput label="GPU model" value={gpuModel} onChange={setGpuModel} />
+        <LabeledInput label="VRAM (GB)" type="number" value={vram} onChange={(v) => setVram(+v)} />
+        <LabeledInput label="CPU cores" type="number" value={cores} onChange={(v) => setCores(+v)} />
+        <LabeledInput label="RAM (GB)" type="number" value={ram} onChange={(v) => setRam(+v)} />
+      </div>
+      <LabeledInput label="Price (₹/hr)" type="number" value={price} onChange={(v) => setPrice(+v)} />
+      {error && <div className="text-sm text-red-600">{error}</div>}
+      <button disabled={busy}
+        className="rounded bg-neutral-800 px-4 py-2 font-medium text-white hover:bg-neutral-900 disabled:opacity-50">
+        {busy ? 'Enrolling…' : 'Enroll this machine'}
+      </button>
+    </form>
+  )
+}
+
+function LabeledInput({ label, value, onChange, type = 'text' }) {
+  return (
+    <label className="text-sm">
+      <span className="font-medium text-neutral-600">{label}</span>
+      <input type={type} value={value} onChange={(e) => onChange(e.target.value)}
+        className="mt-1 w-full rounded border border-neutral-300 px-2 py-1" />
+    </label>
+  )
+}

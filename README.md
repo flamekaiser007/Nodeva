@@ -107,13 +107,32 @@ Phase 1, early. What exists and is tested:
   real Postgres that the write path (settlement) and read path (the
   scheduler's reliability formula) agree exactly, and against the live e2e
   stack that a real container run moves a real counter for the first time.
+- `frontend/src/components/ProviderDashboard.jsx` + `GET /providers/me/dashboard`
+  — the provider side of the marketplace finally has a page: live node
+  status/GPU telemetry (heartbeats were being received and discarded until
+  this -- `onHeartbeat` only ever wrote `last_seen_at`), earnings broken
+  into today/week/month/lifetime, reputation, and node enrollment (public
+  key only -- the private key is generated and stays on the provider's own
+  machine by the Compute Worker, never typed into a browser). One account,
+  two roles: a `Rent GPU` / `Share GPU` toggle, not a second signup.
+  Building the earnings query surfaced a real, easy-to-miss bug: Postgres
+  promotes `SUM(bigint_column)` to `NUMERIC`, which the project's BIGINT
+  type-parser override doesn't cover, so an uncast aggregate came back from
+  node-pg as a **string** -- `'0' !== 0`, no error, no NaN, just silently
+  wrong until something compared it. Fixed by casting every aggregate back
+  to `::bigint` explicitly. Verified live: enrolled a real node through the
+  UI, connected a real worker, and watched it flip from a grey OFFLINE dot
+  to a green ONLINE one via the dashboard's own polling, no manual refresh.
 
-Not built yet: account recovery (forgot-password, email verification), P2P
-discovery beyond one platform-worker link, protecting users from malicious
-providers (no result verification / duplicate execution yet), and a
-reservation-status query a platform could use to resolve the one documented
-node/platform state mismatch that can still leave a user stuck (safe -- no
-money or double-booking risk, just a stuck UX).
+Not built yet: a real payment gateway (`confirm` moves numbers between
+internal ledger accounts; nothing has ever touched an actual processor --
+this is the biggest remaining gap between "demo" and "chargeable MVP"),
+account recovery (forgot-password, email verification), P2P discovery
+beyond one platform-worker link, protecting users from malicious providers
+(no result verification / duplicate execution yet), and a reservation-status
+query a platform could use to resolve the one documented node/platform state
+mismatch that can still leave a user stuck (safe -- no money or
+double-booking risk, just a stuck UX).
 
 ## Running
 

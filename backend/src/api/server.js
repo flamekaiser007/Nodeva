@@ -40,6 +40,13 @@ export function createApp(pool) {
   app.use(cors());
   app.use(express.json());
 
+  // In-memory only, deliberately: heartbeats arrive every 15s and are
+  // superseded by the next one almost immediately, so persisting them to
+  // Postgres would be a lot of writes for data nobody reads historically.
+  // Lost on restart, which is fine -- the next heartbeat repopulates it
+  // within 15s of a node reconnecting.
+  const heartbeats = new Map(); // node_id -> { gpu, live_reservations, received_at }
+
   const hub = new Hub({
     lookupPublicKey: async (nodeId) => {
       const { rows } = await pool.query(
@@ -52,7 +59,17 @@ export function createApp(pool) {
         [nodeId, online ? 'online' : 'offline'],
       ).catch(() => {}); // presence bookkeeping must never crash the socket layer
     },
-    onHeartbeat: (nodeId) => {
+    onHeartbeat: (nodeId, msg) => {
+      // Previously this discarded msg entirely -- the worker has been
+      // sending real GPU utilization/temperature/VRAM every 15s since the
+      // job-execution commit, and nothing ever stored or exposed it. A
+      // provider dashboard showing live hardware state needs this cache;
+      // without it there is no live data to show, only last_seen_at.
+      heartbeats.set(nodeId, {
+        gpu: msg.gpu ?? null,
+        live_reservations: msg.live_reservations ?? null,
+        received_at: Date.now(),
+      });
       pool.query('UPDATE compute_nodes SET last_seen_at = now() WHERE node_id = $1',
         [nodeId]).catch(() => {});
     },
@@ -169,6 +186,78 @@ export function createApp(pool) {
       const { rows } = await pool.query(
         'INSERT INTO providers (user_id) VALUES ($1) RETURNING provider_id', [req.userId]);
       res.status(201).json({ provider_id: rows[0].provider_id });
+    } catch (e) { next(e); }
+  });
+
+  // Everything a provider dashboard needs in one round trip: their nodes
+  // (with live status merged from the hub -- compute_nodes.status is
+  // advisory, updated on presence change, so it can lag a clean disconnect
+  // by nothing but is still cross-checked against hub.isOnline() the same
+  // way search does), live hardware telemetry from the last heartbeat,
+  // reputation, and earnings broken into the buckets a real dashboard shows
+  // (available/today/week/month) -- not just a lifetime total, which is not
+  // what "how did I do today" actually asks.
+  app.get('/providers/me/dashboard', auth, async (req, res, next) => {
+    try {
+      const providerRow = await pool.query(
+        'SELECT provider_id, rep_jobs_total, rep_jobs_failed FROM providers WHERE user_id = $1',
+        [req.userId]);
+      if (!providerRow.rows[0]) {
+        return res.status(404).json({ error: 'not a provider yet -- call POST /providers/me first' });
+      }
+      const provider = providerRow.rows[0];
+
+      const nodesResult = await pool.query(
+        `SELECT node_id, gpu_model, gpu_vram_mb, cpu_cores, ram_mb, price_paise_hr,
+                status, cuda_version, last_seen_at, created_at
+           FROM compute_nodes WHERE provider_id = $1 ORDER BY created_at DESC`,
+        [provider.provider_id]);
+      const nodes = nodesResult.rows.map((n) => {
+        const hb = heartbeats.get(n.node_id);
+        // hub.isOnline() reflects the live socket right now; n.status is the
+        // last presence event Postgres was told about. They can disagree for
+        // an instant around a reconnect -- report both rather than picking
+        // one and hiding a real transient state from the person watching it.
+        return {
+          ...n,
+          online: hub.isOnline(n.node_id),
+          heartbeat: hb ? { ...hb, age_ms: Date.now() - hb.received_at } : null,
+        };
+      });
+
+      // Buckets computed in one query rather than four round trips. FILTER
+      // is the readable way to express "same aggregate, different WHERE" in
+      // Postgres without four separate SUMs each needing their own subquery.
+      // Postgres promotes SUM(bigint) to NUMERIC, not BIGINT -- our type
+      // parser (db/pool.js) only overrides OID 20 (int8), so an uncast SUM
+      // here comes back from node-pg as a STRING, silently, no error, no
+      // NaN, just "0" !== 0 the first time anything compares it. Every
+      // amount in this schema is documented to stay within
+      // Number.isSafeInteger range, so casting back to bigint is exactly as
+      // safe as the rest of the codebase already assumes.
+      const earningsRow = await pool.query(
+        `SELECT
+            COALESCE(SUM(e.amount_paise), 0)::bigint AS available_paise,
+            COALESCE(SUM(e.amount_paise) FILTER (WHERE e.created_at >= now() - interval '1 day'), 0)::bigint AS today_paise,
+            COALESCE(SUM(e.amount_paise) FILTER (WHERE e.created_at >= now() - interval '7 days'), 0)::bigint AS week_paise,
+            COALESCE(SUM(e.amount_paise) FILTER (WHERE e.created_at >= now() - interval '30 days'), 0)::bigint AS month_paise
+           FROM ledger_entries e
+           JOIN ledger_accounts a ON a.account_id = e.account_id
+          WHERE a.kind = 'provider_balance' AND a.owner_provider_id = $1`,
+        [provider.provider_id]);
+
+      res.json({
+        provider_id: provider.provider_id,
+        reputation: {
+          jobs_total: provider.rep_jobs_total,
+          jobs_failed: provider.rep_jobs_failed,
+          reliability: provider.rep_jobs_total > 0
+            ? 1 - provider.rep_jobs_failed / provider.rep_jobs_total
+            : null, // no jobs yet -- null, not a misleading 100% or 0%
+        },
+        earnings: earningsRow.rows[0],
+        nodes,
+      });
     } catch (e) { next(e); }
   });
 
