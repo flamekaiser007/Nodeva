@@ -1,13 +1,19 @@
 import { useState } from 'react'
-import { api, ApiError } from './api'
+import { api, ApiError, setToken } from './api'
 import UserBar from './components/UserBar'
 import SearchForm from './components/SearchForm'
 import ResultsList from './components/ResultsList'
 import ActiveReservation from './components/ActiveReservation'
 
+const STORAGE_KEY = 'nodeva_session' // { token, user }
+
 export default function App() {
-  const [user, setUser] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('nodeva_dev_user')) } catch { return null }
+  const [session, setSession] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY))
+      if (saved?.token) setToken(saved.token) // module-level api.js state, not React state
+      return saved
+    } catch { return null }
   })
   const [lastQuery, setLastQuery] = useState(null)
   const [results, setResults] = useState(null)
@@ -15,6 +21,18 @@ export default function App() {
   const [reservingId, setReservingId] = useState(null)
   const [reservation, setReservation] = useState(null)
   const [error, setError] = useState(null)
+
+  function handleAuth(token, user) {
+    setToken(token)
+    if (token) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ token, user }))
+      setSession({ token, user })
+    } else {
+      localStorage.removeItem(STORAGE_KEY)
+      setSession(null)
+      setReservation(null) // a signed-out session should not keep showing someone else's booking
+    }
+  }
 
   async function handleSearch(req) {
     setSearching(true); setError(null); setResults(null)
@@ -30,13 +48,19 @@ export default function App() {
   }
 
   async function handleReserve(candidate) {
-    if (!user) { setError('sign in first'); return }
+    if (!session) { setError('sign in first'); return }
     setReservingId(candidate.node.id); setError(null)
     try {
-      const r = await api.reserve(candidate.node.id, user.id, lastQuery.starts_at, lastQuery.ends_at)
+      const r = await api.reserve(candidate.node.id, lastQuery.starts_at, lastQuery.ends_at)
       setReservation(r)
     } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
+      if (e instanceof ApiError && e.status === 401) {
+        // The token expired or was never valid for this request -- send the
+        // user back to sign-in rather than showing a cryptic error over a
+        // search form they can't act on anyway.
+        handleAuth(null, null)
+        setError('Your session expired. Please sign in again.')
+      } else if (e instanceof ApiError && e.status === 409) {
         // Auto-refreshing the search here previously wiped this exact
         // message: handleSearch's own setError(null) ran before the user
         // could read it, so the error flashed and vanished instantly.
@@ -60,7 +84,7 @@ export default function App() {
         </p>
       </header>
 
-      <UserBar user={user} onUser={setUser} />
+      <UserBar user={session?.user} onAuth={handleAuth} />
 
       <main className="mx-auto max-w-3xl space-y-6 p-4">
         {error && (

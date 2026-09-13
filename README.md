@@ -70,17 +70,23 @@ Phase 1, early. What exists and is tested:
   receipt, a denied double-booking from the running node, an exact ledger
   settlement, and detection of a killed worker process. Not mocked.
 
-- `frontend/` — React + Tailwind marketplace UI: requirement-based search
-  (not a GPU-model picker), reserve, confirm & pay, submit a job, watch it
+- `frontend/` — React + Tailwind marketplace UI: sign up / log in, requirement-based
+  search (not a GPU-model picker), reserve, confirm & pay, submit a job, watch it
   run. Verified against the real running stack end to end -- a browser
   click produces a signed reservation receipt, runs a real Docker container
   on the worker, and settles the ledger, with the actual container stdout
   displayed back in the page.
+- `backend/src/auth/` — real signup/login: bcrypt password hashing (cost 12),
+  JWT sessions (HS256, 24h expiry, `JWT_SECRET` required at startup -- the
+  server refuses to boot on a missing or short secret rather than silently
+  generating one). Every endpoint that used to trust a client-supplied
+  `user_id`/`provider_id` now derives it from the verified token instead;
+  `/reservations/:id/confirm`, `/jobs`, and `/complete` also check that the
+  caller owns the reservation before acting on it or returning its data.
 
-Not built yet: user auth (the API has a dev-only user-seeding stub, clearly
-marked, not real signup/login), P2P discovery beyond one platform-worker
-link, protecting users from malicious providers (no result verification /
-duplicate execution yet).
+Not built yet: account recovery (forgot-password, email verification), P2P
+discovery beyond one platform-worker link, protecting users from malicious
+providers (no result verification / duplicate execution yet).
 
 ## Running
 
@@ -91,7 +97,10 @@ for f in backend/migrations/*.sql; do
   docker compose exec -T postgres psql -U nodeva -d nodeva < "$f"
 done
 
-# backend tests (33)
+# backend tests (61) -- JWT_SECRET only needed by tests that build the full
+# app (server.js); the unit test files don't call createApp() so most pass
+# without it, but set it anyway to be safe
+export JWT_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
 cd backend && node --test test/*.test.js
 
 # worker tests (20)

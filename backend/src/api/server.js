@@ -1,12 +1,10 @@
 // HTTP + WebSocket server.
 //
-// SCOPE NOTE: this wires the reservation/payment core loop end to end —
-// enroll a node, search, book, confirm, complete a job, settle. It does NOT
-// implement user signup/login. Building real auth (password hashing, session
-// or JWT issuance, account recovery) properly is its own unit of work; a
-// corner-cut version here would look done while being a security liability,
-// which is worse than an honest gap. `POST /dev/users` exists ONLY to seed a
-// user row for exercising the reservation flow and must not ship as-is.
+// SCOPE NOTE: this wires the reservation/payment core loop end to end --
+// signup/login, enroll a node, search, book, confirm, complete a job,
+// settle. Account recovery (forgot-password flows, email verification) is
+// still not built; that gap is now the honest remainder, not the whole of
+// auth. See src/auth/ for password hashing and session issuance.
 
 import express from 'express';
 import cors from 'cors';
@@ -18,9 +16,22 @@ import { searchCandidates } from '../marketplace/nodeStore.js';
 import { rank } from '../marketplace/scheduler.js';
 import { quote, split, meteredCharge } from '../payments/settle.js';
 import { S, canTransition, SETTLEMENT } from '../reservations/machine.js';
+import { hashPassword, verifyPassword } from '../auth/password.js';
+import { requireJwtSecret, signSession } from '../auth/jwt.js';
+import { requireAuth } from '../auth/middleware.js';
+
+// A REAL bcrypt hash of a fixed, never-used value -- not a made-up string.
+// login compares against this when the email does not exist, so bcrypt does
+// real work (and takes real, consistent time) either way. A syntactically
+// invalid hash here would make bcrypt.compare's behavior on the "user does
+// not exist" path unspecified, defeating the point.
+const DUMMY_HASH_FOR_TIMING_SAFETY =
+  '$2b$12$S166KyDHkghng0qE2TtfReFNZp3CAGlX/iFL1s1XgwlQrPyOrKtZi';
 
 export function createApp(pool) {
   const app = express();
+  const jwtSecret = requireJwtSecret();
+  const auth = requireAuth(jwtSecret);
   // Dev-permissive CORS: the frontend runs on a different origin (Vite's
   // dev server). Not something to carry into a real deployment unchanged --
   // production should allow-list the actual frontend origin, not '*'.
@@ -78,32 +89,104 @@ export function createApp(pool) {
     },
   });
 
-  // --- dev-only seeding, see SCOPE NOTE above -------------------------------
-  app.post('/dev/users', async (req, res, next) => {
+  // --- auth ------------------------------------------------------------
+
+  app.post('/auth/signup', async (req, res, next) => {
     try {
-      const { email, display_name } = req.body;
+      const { email, password, display_name } = req.body;
+      if (!email || !password || !display_name) {
+        return res.status(400).json({ error: 'email, password, and display_name are required' });
+      }
+      let hash;
+      try {
+        hash = await hashPassword(password);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
       const { rows } = await pool.query(
         `INSERT INTO users (email, password_hash, display_name)
-         VALUES ($1, 'dev-stub-not-a-real-hash', $2) RETURNING user_id`,
-        [email, display_name]);
-      res.status(201).json({ user_id: rows[0].user_id });
+         VALUES ($1,$2,$3) RETURNING user_id, email, display_name`,
+        [email, hash, display_name]);
+      const user = rows[0];
+      const token = signSession(jwtSecret, { userId: user.user_id, email: user.email });
+      res.status(201).json({
+        token, user: { id: user.user_id, email: user.email, display_name: user.display_name },
+      });
+    } catch (e) {
+      // Unique violation on email -- don't reveal via a different status code
+      // whether an email is registered beyond what "signup failed" already
+      // implies; 409 with a generic reason is enough for this MVP's threat
+      // model (this is not trying to defend against email enumeration via
+      // timing, only against a needlessly specific error message).
+      if (e.code === '23505') return res.status(409).json({ error: 'email already registered' });
+      next(e);
+    }
+  });
+
+  app.post('/auth/login', async (req, res, next) => {
+    try {
+      const { email, password } = req.body;
+      const { rows } = await pool.query(
+        'SELECT user_id, email, display_name, password_hash, account_status FROM users WHERE email = $1',
+        [email]);
+      const user = rows[0];
+      // Constant-shape response whether the email exists or the password is
+      // wrong -- run verifyPassword against a hash either way (a real one, or
+      // this fixed dummy) so a missing account does not respond measurably
+      // faster than a wrong password, which would let an attacker enumerate
+      // registered emails by timing.
+      const hashToCheck = user?.password_hash ?? DUMMY_HASH_FOR_TIMING_SAFETY;
+      const ok = await verifyPassword(password ?? '', hashToCheck);
+      if (!user || !ok) {
+        return res.status(401).json({ error: 'invalid email or password' });
+      }
+      if (user.account_status !== 'active') {
+        return res.status(403).json({ error: `account is ${user.account_status}` });
+      }
+      const token = signSession(jwtSecret, { userId: user.user_id, email: user.email });
+      res.json({
+        token, user: { id: user.user_id, email: user.email, display_name: user.display_name },
+      });
     } catch (e) { next(e); }
   });
 
-  app.post('/dev/providers', async (req, res, next) => {
+  // --- providers ------------------------------------------------------------
+
+  // Any authenticated user can become a provider -- matches the master
+  // design's "a user can potentially also become a provider" (a single
+  // account, not two separate signups). Idempotent: calling it again for an
+  // already-provider user returns their existing provider_id rather than
+  // erroring, since "become a provider" is a state, not a one-shot action.
+  app.post('/providers/me', auth, async (req, res, next) => {
     try {
-      const { user_id } = req.body;
+      const existing = await pool.query(
+        'SELECT provider_id FROM providers WHERE user_id = $1', [req.userId]);
+      if (existing.rows[0]) {
+        return res.json({ provider_id: existing.rows[0].provider_id });
+      }
       const { rows } = await pool.query(
-        'INSERT INTO providers (user_id) VALUES ($1) RETURNING provider_id', [user_id]);
+        'INSERT INTO providers (user_id) VALUES ($1) RETURNING provider_id', [req.userId]);
       res.status(201).json({ provider_id: rows[0].provider_id });
     } catch (e) { next(e); }
   });
 
   // --- node enrollment -------------------------------------------------------
 
-  app.post('/nodes', async (req, res, next) => {
+  // Requires the caller to already be a provider (via /providers/me) and
+  // derives provider_id from THEIR session -- previously this trusted a
+  // provider_id sent in the request body, so anyone could enroll a node
+  // under a provider account that was not theirs. The worker process is not
+  // the one authenticating here; in practice a human enrolls the node's
+  // public key through this endpoint (or a future provider dashboard) once,
+  // then hands the worker its keypair to run with.
+  app.post('/nodes', auth, async (req, res, next) => {
     try {
-      const { provider_id, public_key_hex, gpu_model, gpu_vram_mb,
+      const providerRow = await pool.query(
+        'SELECT provider_id FROM providers WHERE user_id = $1', [req.userId]);
+      if (!providerRow.rows[0]) {
+        return res.status(403).json({ error: 'call POST /providers/me first' });
+      }
+      const { public_key_hex, gpu_model, gpu_vram_mb,
               cpu_cores, ram_mb, price_paise_hr, cuda_version } = req.body;
       const pub = Buffer.from(public_key_hex, 'hex');
       if (pub.length !== 32) {
@@ -114,7 +197,7 @@ export function createApp(pool) {
            (provider_id, public_key, gpu_model, gpu_vram_mb, cpu_cores, ram_mb,
             price_paise_hr, cuda_version)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING node_id`,
-        [provider_id, pub, gpu_model, gpu_vram_mb, cpu_cores, ram_mb,
+        [providerRow.rows[0].provider_id, pub, gpu_model, gpu_vram_mb, cpu_cores, ram_mb,
          price_paise_hr, cuda_version ?? null]);
       res.status(201).json({ node_id: rows[0].node_id });
     } catch (e) { next(e); }
@@ -132,8 +215,17 @@ export function createApp(pool) {
     } catch (e) { next(e); }
   });
 
-  app.post('/nodes/:id/availability', async (req, res, next) => {
+  // Previously anyone could add availability windows to ANY node -- e.g.
+  // advertising a competitor's GPU as available 24/7 at a price the actual
+  // owner never set, or the reverse (no direct exploit there, but no reason
+  // to leave it open). Ownership check mirrors /nodes above.
+  app.post('/nodes/:id/availability', auth, async (req, res, next) => {
     try {
+      const owned = await pool.query(
+        `SELECT 1 FROM compute_nodes n JOIN providers p ON p.provider_id = n.provider_id
+          WHERE n.node_id = $1 AND p.user_id = $2`,
+        [req.params.id, req.userId]);
+      if (!owned.rows[0]) return res.status(404).json({ error: 'not_found' });
       const { window_start, window_end } = req.body;
       await pool.query(
         'INSERT INTO node_availability (node_id, window_start, window_end) VALUES ($1,$2,$3)',
@@ -157,8 +249,12 @@ export function createApp(pool) {
 
   // Lock-then-capture, in that order (see docs/reservation-protocol.md).
   // Money is never touched until the node has signed a receipt.
-  app.post('/reservations', async (req, res, next) => {
-    const { node_id, user_id, starts_at, ends_at } = req.body;
+  // user_id comes from the session, never the request body -- previously a
+  // caller could book (and later confirm/run jobs on) a reservation under
+  // ANY user_id they cared to type in, since nothing verified they owned it.
+  app.post('/reservations', auth, async (req, res, next) => {
+    const { node_id, starts_at, ends_at } = req.body;
+    const user_id = req.userId;
     try {
       const nodeRow = await pool.query(
         'SELECT price_paise_hr FROM compute_nodes WHERE node_id = $1', [node_id]);
@@ -223,14 +319,20 @@ export function createApp(pool) {
   // step calls a real gateway; here it is a stub that always succeeds, kept
   // separate from escrow bookkeeping on purpose (see docs/reservation-protocol.md's
   // distinction between gateway, escrow, and settlement).
-  app.post('/reservations/:id/confirm', async (req, res, next) => {
+  // Without an ownership check here, anyone who learned a reservation_id
+  // (sequential-feeling UUIDs still leak via logs, referrers, browser
+  // history) could pay for -- or worse, run arbitrary jobs against -- a
+  // reservation that was not theirs. auth + the owner check below close
+  // that; a 404 rather than 403 on mismatch avoids confirming to a prober
+  // that the id exists at all.
+  app.post('/reservations/:id/confirm', auth, async (req, res, next) => {
     const client = await pool.connect();
     try {
       const { rows } = await client.query(
         'SELECT * FROM reservations WHERE reservation_id = $1 FOR UPDATE',
         [req.params.id]);
       const resv = rows[0];
-      if (!resv) return res.status(404).json({ error: 'not_found' });
+      if (!resv || resv.user_id !== req.userId) return res.status(404).json({ error: 'not_found' });
       if (!canTransition(resv.status, S.CONFIRMED)) {
         return res.status(409).json({ error: `cannot confirm from ${resv.status}` });
       }
@@ -285,8 +387,23 @@ export function createApp(pool) {
   // Job completion + settlement, shared by the manual endpoint below and
   // by onJobResult once a real job actually finishes -- one settlement path,
   // not two copies that could drift apart.
-  app.post('/reservations/:id/complete', async (req, res, next) => {
+  // MANUAL settlement override -- exists for driving the money side of the
+  // pipeline without a real job (see scripts/e2e_demo.sh's fallback path,
+  // and the tests that predate job execution entirely). This is NOT safe to
+  // expose to arbitrary users in production as-is: a user could call it with
+  // outcome='failed_provider' on their own reservation to claim a refund for
+  // work that actually ran and succeeded, with nothing checking that against
+  // reality the way onJobResult's automatic path does (it settles based on
+  // what the sandboxed executor actually observed, not on a client's say-so).
+  // Ownership is enforced here so at least a user cannot settle someone
+  // ELSE's reservation; a real product should retire this endpoint or gate
+  // it to admin/support roles once job execution is the only settlement path.
+  app.post('/reservations/:id/complete', auth, async (req, res, next) => {
     try {
+      const owned = await pool.query(
+        'SELECT 1 FROM reservations WHERE reservation_id = $1 AND user_id = $2',
+        [req.params.id, req.userId]);
+      if (!owned.rows[0]) return res.status(404).json({ error: 'not_found' });
       const result = await settleReservation(
         pool, req.params.id, req.body.outcome, req.body.compute_seconds);
       if (result.error) return res.status(result.status).json({ error: result.error });
@@ -299,12 +416,12 @@ export function createApp(pool) {
   // Submit a job against a CONFIRMED reservation. Resolves once the node has
   // started the container -- not when the job finishes, which may be hours
   // later and arrives asynchronously via onJobResult below.
-  app.post('/reservations/:id/jobs', async (req, res, next) => {
+  app.post('/reservations/:id/jobs', auth, async (req, res, next) => {
     try {
       const { rows } = await pool.query(
         'SELECT * FROM reservations WHERE reservation_id = $1', [req.params.id]);
       const resv = rows[0];
-      if (!resv) return res.status(404).json({ error: 'not_found' });
+      if (!resv || resv.user_id !== req.userId) return res.status(404).json({ error: 'not_found' });
       if (resv.status !== S.CONFIRMED) {
         return res.status(409).json({ error: `reservation is ${resv.status}, not confirmed` });
       }
@@ -339,9 +456,16 @@ export function createApp(pool) {
     } catch (e) { next(e); }
   });
 
-  app.get('/jobs/:id', async (req, res, next) => {
+  app.get('/jobs/:id', auth, async (req, res, next) => {
     try {
-      const { rows } = await pool.query('SELECT * FROM jobs WHERE job_id = $1', [req.params.id]);
+      // A job's stdout/stderr can contain whatever the user's own code
+      // printed -- possibly sensitive to THEM, not something another
+      // authenticated user should be able to read by guessing/enumerating
+      // job ids. Join to reservations to check ownership.
+      const { rows } = await pool.query(
+        `SELECT j.* FROM jobs j JOIN reservations r ON r.reservation_id = j.reservation_id
+          WHERE j.job_id = $1 AND r.user_id = $2`,
+        [req.params.id, req.userId]);
       if (!rows[0]) return res.status(404).json({ error: 'not_found' });
       res.json(rows[0]);
     } catch (e) { next(e); }

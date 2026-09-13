@@ -20,10 +20,14 @@ the default port.
 
 ## What's real vs. a stand-in
 
-- Sign-in is a dev-only stub (`UserBar.jsx`, backed by `POST /dev/users`) — the
-  backend marks that endpoint explicitly as not for production. Everything else in
-  this app only depends on having a `userId`, so real auth drops in without
-  touching the rest of the UI.
+- Sign-in is real: `UserBar.jsx` calls the backend's `POST /auth/signup` and
+  `POST /auth/login`, which hash passwords with bcrypt and issue a JWT. The
+  token is stored in `localStorage` and attached as a Bearer token to every
+  subsequent request by `api.js` -- nothing in this app ever sees a password
+  hash or reads/writes a `user_id` directly; the backend derives it from the
+  token.
+- Account recovery (forgot-password, email verification) is not built --
+  that's the honest remaining gap, not sign-in itself.
 - Everything past sign-in is real: the reservation, confirmation, and job
   submission all hit the actual backend, which talks to an actual worker process
   over a real signed WebSocket connection, which runs an actual sandboxed Docker
@@ -37,4 +41,4 @@ the default port.
   expected-cost shown rather than hidden behind a ranking.
 - `src/components/ActiveReservation.jsx` — the reservation lifecycle
   (held → confirmed → running → terminal), one at a time.
-- `src/components/UserBar.jsx` — the dev-only auth stand-in.
+- `src/components/UserBar.jsx` — real signup/login form.

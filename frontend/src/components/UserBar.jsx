@@ -1,25 +1,25 @@
 import { useState } from 'react'
 import { api } from '../api'
 
-// Dev-only stand-in for real sign-in. Backed by POST /dev/users, which the
-// backend marks explicitly as not-for-production (see server.js). A real
-// build replaces this component with actual signup/login; nothing else in
-// this app should need to change when that happens, since everything else
-// only depends on having a `userId`.
-export default function UserBar({ user, onUser }) {
+// Real signup/login against POST /auth/signup and /auth/login -- bcrypt
+// hashing and JWT issuance happen server-side; this component only ever
+// sees the token back, never touches a password hash.
+export default function UserBar({ user, onAuth }) {
+  const [mode, setMode] = useState('login') // 'login' | 'signup'
   const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
   const [name, setName] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
 
-  async function createUser(e) {
+  async function submit(e) {
     e.preventDefault()
     setBusy(true); setError(null)
     try {
-      const { user_id } = await api.createDevUser(email, name)
-      const u = { id: user_id, email, name }
-      localStorage.setItem('nodeva_dev_user', JSON.stringify(u))
-      onUser(u)
+      const result = mode === 'signup'
+        ? await api.signup(email, password, name)
+        : await api.login(email, password)
+      onAuth(result.token, result.user)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -29,16 +29,13 @@ export default function UserBar({ user, onUser }) {
 
   if (user) {
     return (
-      <div className="flex items-center justify-between border-b border-amber-200 bg-amber-50 px-4 py-2 text-sm">
+      <div className="flex items-center justify-between border-b border-neutral-200 bg-white px-4 py-2 text-sm">
         <span>
-          Signed in as <strong>{user.name}</strong> ({user.email})
-          <span className="ml-2 rounded bg-amber-200 px-1.5 py-0.5 text-xs font-medium text-amber-900">
-            dev mode — not real auth
-          </span>
+          Signed in as <strong>{user.display_name}</strong> ({user.email})
         </span>
         <button
           className="text-xs text-neutral-500 underline hover:text-neutral-800"
-          onClick={() => { localStorage.removeItem('nodeva_dev_user'); onUser(null) }}
+          onClick={() => onAuth(null, null)}
         >
           sign out
         </button>
@@ -47,16 +44,31 @@ export default function UserBar({ user, onUser }) {
   }
 
   return (
-    <form onSubmit={createUser} className="flex flex-wrap items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-4 py-3 text-sm">
-      <span className="font-medium text-neutral-600">Dev sign-in:</span>
+    <form onSubmit={submit} className="flex flex-wrap items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-4 py-3 text-sm">
+      <div className="mr-2 flex overflow-hidden rounded border border-neutral-300">
+        <button type="button" onClick={() => setMode('login')}
+          className={`px-2 py-1 ${mode === 'login' ? 'bg-neutral-800 text-white' : 'bg-white text-neutral-600'}`}>
+          Log in
+        </button>
+        <button type="button" onClick={() => setMode('signup')}
+          className={`px-2 py-1 ${mode === 'signup' ? 'bg-neutral-800 text-white' : 'bg-white text-neutral-600'}`}>
+          Sign up
+        </button>
+      </div>
       <input required type="email" placeholder="email" value={email}
         onChange={(e) => setEmail(e.target.value)}
         className="rounded border border-neutral-300 px-2 py-1" />
-      <input required placeholder="display name" value={name}
-        onChange={(e) => setName(e.target.value)}
+      {mode === 'signup' && (
+        <input required placeholder="display name" value={name}
+          onChange={(e) => setName(e.target.value)}
+          className="rounded border border-neutral-300 px-2 py-1" />
+      )}
+      <input required type="password" placeholder="password" value={password}
+        minLength={mode === 'signup' ? 8 : undefined}
+        onChange={(e) => setPassword(e.target.value)}
         className="rounded border border-neutral-300 px-2 py-1" />
       <button disabled={busy} className="rounded bg-neutral-800 px-3 py-1 text-white disabled:opacity-50">
-        {busy ? 'creating…' : 'Continue'}
+        {busy ? 'Please wait…' : mode === 'signup' ? 'Create account' : 'Log in'}
       </button>
       {error && <span className="text-red-600">{error}</span>}
     </form>

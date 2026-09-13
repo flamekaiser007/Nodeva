@@ -8,8 +8,10 @@
     "migrate": "node src/db/migrate.js"
   },
   "dependencies": {
+    "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "express": "^4.22.2",
+    "jsonwebtoken": "^9.0.3",
     "pg": "^8.23.0",
     "ws": "^8.21.3"
   }
