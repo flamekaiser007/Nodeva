@@ -269,6 +269,48 @@ Phase 1, early. What exists and is tested:
   own validation: refusing a tiebreak against a still-matched group,
   against a reservation on one of the two disputing nodes, and a second
   tiebreak attempt against an already-resolved group).
+- **Frontend UI for verification and dispute resolution** -- until now the
+  backend's verification and tiebreak endpoints had no way to reach them
+  except curl; `ResultsList`'s "Verify with another node" button puts the
+  list into a partner-picking mode, `VerifiedPairReservation` drives two
+  independent "Confirm & Pay" steps and one joint job submission, and
+  `DisputeResolution` (mounted automatically when both reservations settle
+  `disputed`) walks the user through booking, confirming, and running a
+  third-node tiebreaker, then shows the verdict. Added `GET
+  /reservations/:id` (ownership-scoped, 404 on mismatch like every other
+  reservation route) specifically because a job's own status doesn't say
+  whether its RESERVATION ended up disputed -- see `jobRowStatusToOutcome`'s
+  comment for why those are different vocabularies.
+
+  Caught live, not by a unit test: switching to "Share GPU" and back
+  unmounts `VerifiedPairReservation` (App only renders one view at a time),
+  and it was re-seeding its status from the original booking-time prop
+  snapshot on remount -- a reservation confirmed minutes earlier silently
+  showed "held" again, with a stale error banner from an unrelated earlier
+  double-click still attached. Fixed by re-fetching both reservations'
+  authoritative status from the backend on every mount via the new GET
+  route, instead of trusting the prop. A related, deliberately UNFIXED gap
+  is noted in the code: if a job was already submitted in an earlier mount,
+  its `job_id` is not persisted anywhere outside that mount's own state, so
+  a remount can't resume showing its progress -- surfaced as an honest
+  message rather than silently re-showing a submission form that would
+  just fail against a reservation that already has a job.
+
+  Verified end-to-end against three real worker processes, three real
+  Docker-sandboxed nodes, and a real Razorpay-unconfigured backend in an
+  actual browser: booked and confirmed a verified pair, survived the
+  mount/remount bug being fixed live, submitted a matching job (both
+  settled `completed`, ledger and reputation correct), then forced a
+  genuine mismatch with a nondeterministic command
+  (`cat /proc/sys/kernel/random/uuid`, run identically on both nodes) to
+  get a REAL dispute — no scripted/fake worker involved — booked a real
+  third node as tiebreaker, and confirmed the resulting `inconclusive`
+  verdict (the random tiebreaker output agreed with neither original,
+  correctly) matched exactly between the UI and the `dispute_resolutions`
+  table. The `attributed` (fault-to-one-side) verdict path is exercised by
+  `dispute-resolution.test.js`'s scripted-worker tests rather than live
+  here, since manufacturing a live one requires an intentionally lying
+  worker -- the same honest tradeoff the automated suite exists to cover.
 
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need

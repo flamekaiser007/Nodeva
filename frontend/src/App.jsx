@@ -4,6 +4,7 @@ import UserBar from './components/UserBar'
 import SearchForm from './components/SearchForm'
 import ResultsList from './components/ResultsList'
 import ActiveReservation from './components/ActiveReservation'
+import VerifiedPairReservation from './components/VerifiedPairReservation'
 import ProviderDashboard from './components/ProviderDashboard'
 import ResetPassword from './components/ResetPassword'
 
@@ -35,6 +36,13 @@ export default function App() {
   const [searching, setSearching] = useState(false)
   const [reservingId, setReservingId] = useState(null)
   const [reservation, setReservation] = useState(null)
+  // A candidate awaiting a verification partner pick (docs/security-model.md's
+  // Direction 2) -- set while ResultsList is in "choose a second node"
+  // mode, null the rest of the time. Once a partner is picked, this
+  // resolves into `verifiedPair` below rather than `reservation`, since a
+  // verified booking is genuinely two reservations, not one.
+  const [verifyPrimary, setVerifyPrimary] = useState(null)
+  const [verifiedPair, setVerifiedPair] = useState(null)
   const [error, setError] = useState(null)
 
   // Short-circuits the whole normal app -- someone landing here clicked a
@@ -58,12 +66,15 @@ export default function App() {
       localStorage.removeItem(STORAGE_KEY)
       setSession(null)
       setReservation(null) // a signed-out session should not keep showing someone else's booking
+      setVerifiedPair(null)
+      setVerifyPrimary(null)
     }
   }
 
   async function handleSearch(req) {
     setSearching(true); setError(null); setResults(null)
     setLastQuery(req)
+    setVerifyPrimary(null) // a fresh search invalidates whatever candidate was mid-pick
     try {
       const { results } = await api.search(req)
       setResults(results)
@@ -101,6 +112,54 @@ export default function App() {
     }
   }
 
+  // Enters "pick a verification partner" mode -- ResultsList itself
+  // decides how that's presented, this just records which candidate needs
+  // one. Nothing is reserved yet: a hold ticking down while the user is
+  // still choosing a partner would waste it for no reason.
+  function handleStartVerification(candidate) {
+    setError(null)
+    setVerifyPrimary(candidate)
+  }
+
+  function handleCancelVerification() {
+    setVerifyPrimary(null)
+  }
+
+  // Books BOTH nodes for the same window once a partner is chosen --
+  // verify_against_reservation_id (used once the job is submitted, see
+  // VerifiedPairReservation) requires two reservations that already exist,
+  // not one reservation plus a promise to add a second later.
+  async function handlePickPartner(partnerCandidate) {
+    if (!session) { setError('sign in first'); return }
+    const primaryCandidate = verifyPrimary
+    setError(null)
+    try {
+      setReservingId(primaryCandidate.node.id)
+      const resA = await api.reserve(primaryCandidate.node.id, lastQuery.starts_at, lastQuery.ends_at)
+      setReservingId(partnerCandidate.node.id)
+      const resB = await api.reserve(partnerCandidate.node.id, lastQuery.starts_at, lastQuery.ends_at)
+      setVerifiedPair({
+        a: { ...resA, node_id: primaryCandidate.node.id, node_model: primaryCandidate.node.gpu_model },
+        b: { ...resB, node_id: partnerCandidate.node.id, node_model: partnerCandidate.node.gpu_model },
+      })
+      setVerifyPrimary(null)
+    } catch (e) {
+      // If the primary reservation succeeded but the partner failed, the
+      // primary is left as an orphaned 'held' row -- there is no
+      // client-facing release endpoint for an unconfirmed hold, so it
+      // simply expires on its own via the node's hold TTL, the same as any
+      // other abandoned held reservation in this app.
+      if (e instanceof ApiError && e.status === 401) {
+        handleAuth(null, null)
+        setError('Your session expired. Please sign in again.')
+      } else {
+        setError(e.message)
+      }
+    } finally {
+      setReservingId(null)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-neutral-100">
       <header className="border-b border-neutral-200 bg-white px-4 py-3">
@@ -127,6 +186,11 @@ export default function App() {
 
         {mode === 'share' && session ? (
           <ProviderDashboard />
+        ) : verifiedPair ? (
+          <VerifiedPairReservation
+            pair={verifiedPair}
+            onSettled={() => { setVerifiedPair(null); handleSearch(lastQuery) }}
+          />
         ) : reservation ? (
           <ActiveReservation
             reservation={reservation}
@@ -135,7 +199,13 @@ export default function App() {
         ) : (
           <>
             <SearchForm onSearch={handleSearch} busy={searching} />
-            <ResultsList results={results} onReserve={handleReserve} reservingId={reservingId} />
+            <ResultsList
+              results={results} onReserve={handleReserve} reservingId={reservingId}
+              verifyPrimary={verifyPrimary}
+              onStartVerification={handleStartVerification}
+              onPickPartner={handlePickPartner}
+              onCancelVerification={handleCancelVerification}
+            />
           </>
         )}
       </main>

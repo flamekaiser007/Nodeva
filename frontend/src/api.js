@@ -72,14 +72,34 @@ export const api = {
       body: JSON.stringify({ razorpay_order_id, razorpay_payment_id, razorpay_signature }),
     }),
 
+  // Used to poll whether a reservation reached 'disputed' -- a job's own
+  // status (getJob below) doesn't tell you that; see server.js's
+  // jobRowStatusToOutcome comment for why the two vocabularies diverge.
+  getReservation: (reservationId) => request(`/reservations/${reservationId}`),
+
   // --- jobs --------------------------------------------------------
-  submitJob: (reservationId, { image, command, timeout_seconds }) =>
+  // Pass verify_against_reservation_id (a second, separately booked and
+  // confirmed reservation on a DIFFERENT node) to run this identical job on
+  // both and compare results -- see docs/security-model.md's Direction 2.
+  submitJob: (reservationId, { image, command, timeout_seconds, verify_against_reservation_id }) =>
     request(`/reservations/${reservationId}/jobs`, {
       method: 'POST',
-      body: JSON.stringify({ image, command, timeout_seconds }),
+      body: JSON.stringify({ image, command, timeout_seconds, verify_against_reservation_id }),
     }),
 
   getJob: (jobId) => request(`/jobs/${jobId}`),
+
+  // --- dispute resolution --------------------------------------------------
+  // Submits a third, independently-booked reservation as a tiebreaker
+  // against a verification group that came back disputed. Reputation-only:
+  // never re-litigates the refund already issued to both original nodes.
+  submitTiebreaker: (groupId, reservationId) =>
+    request(`/verification-groups/${groupId}/tiebreak`, {
+      method: 'POST',
+      body: JSON.stringify({ reservation_id: reservationId }),
+    }),
+
+  getDisputeResolution: (groupId) => request(`/verification-groups/${groupId}/resolution`),
 
   // --- provider --------------------------------------------------------
   becomeProvider: () => request('/providers/me', { method: 'POST' }),

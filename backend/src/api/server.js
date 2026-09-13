@@ -545,6 +545,23 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
     }
   });
 
+  // Read-only status check, ownership-scoped the same way every other
+  // reservation route is (404, not 403, on mismatch -- see the comment
+  // below on /confirm for why). Added specifically so a client can poll
+  // whether a reservation reached 'disputed' -- a job's own GET /jobs/:id
+  // still reports its own outcome (e.g. 'succeeded') even when the
+  // RESERVATION was disputed by a verification mismatch, since the two are
+  // genuinely different vocabularies (see jobRowStatusToOutcome's comment).
+  app.get('/reservations/:id', auth, async (req, res, next) => {
+    try {
+      const { rows } = await pool.query(
+        'SELECT * FROM reservations WHERE reservation_id = $1 AND user_id = $2',
+        [req.params.id, req.userId]);
+      if (!rows[0]) return res.status(404).json({ error: 'not_found' });
+      res.json(rows[0]);
+    } catch (e) { next(e); }
+  });
+
   // Payment capture + committing the node's hold. In production the capture
   // step calls a real gateway; here it is a stub that always succeeds, kept
   // separate from escrow bookkeeping on purpose (see docs/reservation-protocol.md's
