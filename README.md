@@ -373,6 +373,21 @@ Phase 1, early. What exists and is tested:
   app on a real route, hitting `/auth/login` for real until the 429 lands.
   Full suite is now 198 tests.
 
+- **Closed the image-allowlist gap `docs/security-model.md` named since
+  its first draft.** `jobs/imageAllowlist.js` rejects (400, before the
+  worker ever sees it) any job whose image repository isn't on a
+  configured allowlist (`ALLOWED_IMAGE_REPOS`, defaulting to a handful of
+  Docker Hub official images). This stops a wholly arbitrary,
+  attacker-controlled image -- the direct supply-chain attack the doc
+  named -- but does not pin digests, a deliberate, explicitly-stated scope
+  cut (a real deployment's own decision to make, trading usability for a
+  stronger guarantee). Tested at the unit level (`imageAllowlist.test.js`
+  -- reference parsing including registry-port edge cases, allowlist
+  override via env) and via a real end-to-end check
+  (`imageAllowlist-integration.test.js`) proving a disallowed image never
+  reaches the worker's `docker run` at all, using a scripted worker that
+  records whether `JOB_SUBMIT` ever arrived. Full suite is now 211 tests.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.

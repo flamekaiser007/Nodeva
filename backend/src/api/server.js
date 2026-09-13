@@ -22,6 +22,7 @@ import { requireJwtSecret, signSession } from '../auth/jwt.js';
 import { requireAuth } from '../auth/middleware.js';
 import { generateResetToken, hashResetToken } from '../auth/passwordReset.js';
 import { rateLimit } from '../auth/rateLimit.js';
+import { checkImageAllowed } from '../jobs/imageAllowlist.js';
 import { createEmailSenderFromEnv, resetPasswordEmailBody } from '../auth/email.js';
 import {
   createGatewayFromEnv, verifyPaymentSignature, verifyWebhookSignature,
@@ -874,6 +875,18 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
       }
 
       const { image, command, env, gpu, verify_against_reservation_id } = req.body;
+
+      // docs/security-model.md's Direction 1 supply-chain gap: `docker run`
+      // pulls whatever image reference is given it, and a malicious image
+      // is itself a payload independent of the sandbox flags around it.
+      // Checked here, before anything else about this job is touched, so a
+      // disallowed image never reaches hub.submitJob (and therefore never
+      // reaches a worker's `docker run`) regardless of what else is true
+      // about the request.
+      const imageCheck = checkImageAllowed(image);
+      if (!imageCheck.allowed) {
+        return res.status(400).json({ error: `image_not_allowed: ${imageCheck.reason}` });
+      }
 
       let sibling = null;
       if (verify_against_reservation_id) {

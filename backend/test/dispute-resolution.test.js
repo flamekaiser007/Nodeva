@@ -316,7 +316,7 @@ test('tiebreak is refused on a group that never disputed (a plain match)', { ski
   const submitRes = await json(await fetch(`${base}/reservations/${a.reservation_id}/jobs`, {
     method: 'POST', headers: { ...authed(buyer.token), 'content-type': 'application/json' },
     body: JSON.stringify({
-      image: 'x', command: ['x'], verify_against_reservation_id: b.reservation_id,
+      image: 'alpine:3.20', command: ['echo', 'x'], verify_against_reservation_id: b.reservation_id,
     }),
   }));
   await waitForTerminalStatus(a.reservation_id);

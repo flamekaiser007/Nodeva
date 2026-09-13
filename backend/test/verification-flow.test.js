@@ -296,7 +296,7 @@ test('reputation is untouched for a disputed job -- fault cannot be attributed f
 
   await fetch(`${base}/reservations/${a.reservation_id}/jobs`, {
     method: 'POST', headers: { ...authed(buyer.token), 'content-type': 'application/json' },
-    body: JSON.stringify({ image: 'x', command: ['x'], verify_against_reservation_id: b.reservation_id }),
+    body: JSON.stringify({ image: 'alpine:3.20', command: ['echo', 'x'], verify_against_reservation_id: b.reservation_id }),
   });
   await waitForTerminalStatus(a.reservation_id);
 
@@ -311,7 +311,7 @@ test('verification requires two DIFFERENT nodes -- a node cannot verify against 
   const [a] = await setUpTwoConfirmedReservations(buyer.token);
   const res = await fetch(`${base}/reservations/${a.reservation_id}/jobs`, {
     method: 'POST', headers: { ...authed(buyer.token), 'content-type': 'application/json' },
-    body: JSON.stringify({ image: 'x', command: ['x'], verify_against_reservation_id: a.reservation_id }),
+    body: JSON.stringify({ image: 'alpine:3.20', command: ['echo', 'x'], verify_against_reservation_id: a.reservation_id }),
   });
   assert.equal(res.status, 400);
 });
@@ -326,7 +326,7 @@ test("a sibling reservation belonging to another user is rejected, not silently 
   const res = await fetch(`${base}/reservations/${a.reservation_id}/jobs`, {
     method: 'POST', headers: { ...authed(buyer.token), 'content-type': 'application/json' },
     body: JSON.stringify({
-      image: 'x', command: ['x'],
+      image: 'alpine:3.20', command: ['echo', 'x'],
       verify_against_reservation_id: otherReservations[0].reservation_id,
     }),
   });

@@ -43,11 +43,23 @@ explicitly accept the residual risk.
   process's VRAM if the driver allows it). **Untested on this development
   machine, which has no NVIDIA GPU** — the code path exists behind a flag but
   needs validation on real GPU hardware before it is trusted.
-- **Image pulls are a supply-chain risk.** `docker run` pulls whatever image
-  reference the user supplies. A malicious image is itself a payload,
-  independent of anything the sandbox does at runtime. MVP has no image
-  allowlist or digest-pinning requirement; this needs a policy decision
-  before opening the platform to arbitrary images.
+- **Image pulls are a supply-chain risk -- now partially closed.**
+  `docker run` pulls whatever image reference it's given, and a malicious
+  image is itself a payload independent of anything the sandbox does at
+  runtime. `jobs/imageAllowlist.js` makes the policy decision this doc used
+  to leave open: `POST /reservations/:id/jobs` now rejects (400, before the
+  worker ever sees it) any image whose repository isn't on a configured
+  allowlist (`ALLOWED_IMAGE_REPOS`; defaults to a handful of Docker Hub
+  official images -- `alpine`, `python`, `pytorch/pytorch`, etc.). This
+  stops a wholly arbitrary, attacker-controlled image -- the direct version
+  of the attack this bullet named. It does **not** pin digests: a tag like
+  `python:3.12` can still be re-pointed to different content over time by
+  whoever controls that repo. The allowlist's default trusts Docker Hub's
+  official-image maintenance process; that is trust in a maintainer, not a
+  cryptographic guarantee. Requiring digest pins (`python@sha256:...`)
+  would close that remaining gap but trades away usability (a user must
+  resolve and supply a digest for every job) -- a deliberate scope cut for
+  whoever operates a real deployment to make, not forced silently here.
 - **Side channels** (cache timing, power analysis) are not addressed and are
   not currently considered in scope for the MVP threat model.
 
