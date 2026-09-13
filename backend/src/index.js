@@ -2,9 +2,10 @@ import http from 'node:http';
 import { createPool } from './db/pool.js';
 import { createApp, attachWebSocketServer } from './api/server.js';
 import { expireStaleHolds } from './reservations/reconciler.js';
+import { processRefundRetries } from './payments/refunds.js';
 
 const pool = createPool();
-const { app, hub } = createApp(pool);
+const { app, hub, paymentGateway } = createApp(pool);
 const server = http.createServer(app);
 attachWebSocketServer(server, hub);
 
@@ -22,6 +23,14 @@ setInterval(() => hub.sweepStale(), 15_000);
 setInterval(() => {
   expireStaleHolds(pool).catch((e) => console.error('reconciler sweep failed:', e));
 }, 15_000);
+
+// Retries a compensating refund that failed on its first attempt (gateway
+// outage, network blip, rate limit) -- see payments/refunds.js. A no-op
+// (processRefundRetries checks isConfigured itself) when no live gateway is
+// configured, since there is nothing to retry against.
+setInterval(() => {
+  processRefundRetries(pool, paymentGateway).catch((e) => console.error('refund retry sweep failed:', e));
+}, 30_000);
 
 const port = process.env.PORT ?? 3000;
 server.listen(port, () => console.log(`nodeva backend listening on :${port}`));

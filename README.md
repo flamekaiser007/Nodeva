@@ -145,14 +145,25 @@ Phase 1, early. What exists and is tested:
   and the webhook path was initially missing that compensation (a fix
   informed by, not just followed by, the test that first proved the direct
   verify endpoint needed it).
+- `backend/src/payments/refunds.js` — closes that same commit's own named
+  gap: a compensating refund that fails is no longer just a `console.error`.
+  `issueRefund` is now the single place all three refund call sites
+  (direct-verify, webhook, `settleReservation`) go through, and a failure
+  is recorded in a durable `refund_retries` table and retried with capped
+  exponential backoff (1m → 1h, up to 10 attempts) by a periodic sweep,
+  rather than depending on a human reading logs. Consolidating three
+  near-duplicate implementations into one is also what closes the door on
+  the exact bug the prior commit found (one copy silently missing the
+  refund call) recurring a second time. See
+  [docs/payment-architecture.md](docs/payment-architecture.md)'s "Refund
+  retries" section.
 
 Not built yet: account recovery (forgot-password, email verification), P2P
 discovery beyond one platform-worker link, protecting users from malicious
-providers (no result verification / duplicate execution yet), a
+providers (no result verification / duplicate execution yet), and a
 reservation-status query a platform could use to resolve the one documented
 node/platform state mismatch that can still leave a user stuck (safe -- no
-money or double-booking risk, just a stuck UX), and a durable retry queue
-for the rare case where a compensating refund call to the gateway itself fails.
+money or double-booking risk, just a stuck UX).
 
 ## Running
 
@@ -163,7 +174,7 @@ for f in backend/migrations/*.sql; do
   docker compose exec -T postgres psql -U nodeva -d nodeva < "$f"
 done
 
-# backend tests (101) -- JWT_SECRET only needed by tests that build the full
+# backend tests (109) -- JWT_SECRET only needed by tests that build the full
 # app (server.js); the unit test files don't call createApp() so most pass
 # without it, but set it anyway to be safe. Several suites (reconciler,
 # reputation-integration, dashboard, payment-flow) additionally need a

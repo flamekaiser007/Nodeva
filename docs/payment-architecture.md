@@ -118,13 +118,30 @@ A `payments` row is still inserted in this mode (`gateway='none'`) — the
 table (defined since the very first migration, unused until this) is now the
 single audit trail regardless of which mode produced a given charge.
 
+## Refund retries
+
+The gap named above as unsolved in an earlier draft of this document —
+*"a failed compensating refund is just a `console.error`"* — is now closed.
+`backend/src/payments/refunds.js`'s `issueRefund` is the single place all
+three refund call sites (the direct-verify endpoint, the webhook, and
+`settleReservation`'s own refund path) go through; a failed attempt is
+recorded in a durable `refund_retries` table (migration `003`) rather than
+only logged, and a periodic sweep (`processRefundRetries`, every 30s in
+`index.js`) retries it with capped exponential backoff (1m, 2m, 4m, ... up
+to 1h) for up to 10 attempts before marking it `exhausted` — the row that
+genuinely needs a human, distinguished from the ones expected to resolve on
+their own.
+
+Before this, the three call sites each hand-implemented the same
+try/refund/catch shape independently — which is exactly the pattern that let
+the webhook handler's copy ship missing its refund call entirely (fixed in
+the commit that added it, once a webhook-specific test caught the gap).
+Consolidating all three into one `issueRefund` function removes that class
+of bug going forward: there is exactly one place refund behavior lives, so
+it cannot drift from itself a second time.
+
 ## What's not solved yet
 
-- **No retry queue for a failed compensating refund.** If the gateway's
-  refund call itself fails right after a node turns out unreachable, the
-  current answer is a `console.error` marked CRITICAL and a human has to
-  notice it. A real deployment needs this to be a durable, retried job, not
-  a log line.
 - **Live-account validation.** Everything named above as "not verified"
   needs a real Razorpay test-mode account (free to create, requires no
   business verification for test keys) before this should be trusted beyond

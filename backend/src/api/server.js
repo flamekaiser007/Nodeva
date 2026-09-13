@@ -24,6 +24,7 @@ import { requireAuth } from '../auth/middleware.js';
 import {
   createGatewayFromEnv, verifyPaymentSignature, verifyWebhookSignature,
 } from '../payments/razorpay.js';
+import { issueRefund } from '../payments/refunds.js';
 
 // A REAL bcrypt hash of a fixed, never-used value -- not a made-up string.
 // login compares against this when the email does not exist, so bcrypt does
@@ -538,20 +539,14 @@ export function createApp(pool, { paymentGateway } = {}) {
 
       const result = await commitNodeAndCapture(client, hub, resv);
       if (result.error) {
-        try {
-          await razorpay.refund(razorpay_payment_id, resv.quoted_paise);
-          await pool.query("UPDATE payments SET status='refunded' WHERE payment_id=$1", [payment.payment_id]);
-        } catch (refundErr) {
-          // Loud and unambiguous: a failed automatic refund after a
-          // confirmed charge is exactly the kind of drift that must never
-          // fail silently. Manual reconciliation is the fallback until this
-          // has a retry queue.
-          console.error(
-            `CRITICAL: payment ${razorpay_payment_id} was captured but the node was ` +
-            `unreachable and the compensating refund ALSO failed -- manual refund required:`,
-            refundErr);
-        }
-        return res.status(result.status).json({ error: result.error, refunded: true });
+        const refundResult = await issueRefund(pool, razorpay, {
+          paymentId: payment.payment_id, reservationId: resv.reservation_id,
+          gatewayRef: razorpay_payment_id, amountPaise: resv.quoted_paise,
+        });
+        return res.status(result.status).json({
+          error: result.error,
+          refund_status: refundResult.ok ? 'refunded' : 'queued_for_retry',
+        });
       }
       res.json(result);
     } catch (e) {
@@ -605,24 +600,18 @@ export function createApp(pool, { paymentGateway } = {}) {
             const resv = rows[0];
             if (resv && canTransition(resv.status, S.CONFIRMED)) {
               const result = await commitNodeAndCapture(client, hub, resv);
-              // Mirrors the /confirm/verify endpoint's compensating refund --
-              // this branch was missing it on the first pass, which would
-              // have left a payment captured-but-unrefunded for a slot the
-              // node never delivered whenever the WEBHOOK (rather than the
-              // client callback) was the path that observed the failure.
-              // The two paths must agree, since either can be the one that
-              // actually runs for a given payment.
+              // Mirrors the /confirm/verify endpoint's compensating refund via
+              // the same issueRefund() helper -- this branch was missing it
+              // entirely on the first pass, which would have left a payment
+              // captured-but-unrefunded for a slot the node never delivered
+              // whenever the WEBHOOK (rather than the client callback) was the
+              // path that observed the failure. Both paths now share one
+              // implementation instead of two copies that could drift again.
               if (result.error) {
-                try {
-                  await razorpay.refund(paymentEntity.id, payment.amount_paise);
-                  await client.query("UPDATE payments SET status='refunded' WHERE payment_id=$1",
-                    [payment.payment_id]);
-                } catch (refundErr) {
-                  console.error(
-                    `CRITICAL: payment ${paymentEntity.id} was captured via webhook but the ` +
-                    `node was unreachable and the compensating refund ALSO failed -- manual refund required:`,
-                    refundErr);
-                }
+                await issueRefund(pool, razorpay, {
+                  paymentId: payment.payment_id, reservationId: payment.reservation_id,
+                  gatewayRef: paymentEntity.id, amountPaise: payment.amount_paise,
+                });
               }
             }
           } finally {
@@ -732,7 +721,10 @@ export function createApp(pool, { paymentGateway } = {}) {
     res.status(500).json({ error: 'internal_error' });
   });
 
-  return { app, hub };
+  // `razorpay` exposed so index.js can run the periodic refund-retry sweep
+  // (payments/refunds.js's processRefundRetries) against the same gateway
+  // instance the app itself uses -- not a second one reading env vars again.
+  return { app, hub, paymentGateway: razorpay };
 }
 
 // executor.py's JobResult.status vocabulary -> jobs.status (schema-constrained).
@@ -914,21 +906,15 @@ export async function settleReservation(pool, reservationId, outcome, computeSec
     // back succeeded yet), it is logged loudly for manual follow-up instead
     // -- the same posture as the verify endpoint's compensating-refund path.
     if (refund > 0 && paymentGateway?.isConfigured) {
-      try {
-        const paid = await pool.query(
-          `SELECT gateway_ref FROM payments WHERE reservation_id = $1 AND status = 'captured'
-             AND gateway = 'razorpay' LIMIT 1`,
-          [resv.reservation_id]);
-        if (paid.rows[0]) {
-          await paymentGateway.refund(paid.rows[0].gateway_ref, refund);
-          await pool.query(
-            `UPDATE payments SET status='refunded' WHERE reservation_id=$1 AND gateway_ref=$2`,
-            [resv.reservation_id, paid.rows[0].gateway_ref]);
-        }
-      } catch (e) {
-        console.error(
-          `CRITICAL: reservation ${resv.reservation_id} owes a ${refund}-paise refund ` +
-          `that the gateway call failed to issue -- manual refund required:`, e);
+      const paid = await pool.query(
+        `SELECT payment_id, gateway_ref FROM payments WHERE reservation_id = $1 AND status = 'captured'
+           AND gateway = 'razorpay' LIMIT 1`,
+        [resv.reservation_id]);
+      if (paid.rows[0]) {
+        await issueRefund(pool, paymentGateway, {
+          paymentId: paid.rows[0].payment_id, reservationId: resv.reservation_id,
+          gatewayRef: paid.rows[0].gateway_ref, amountPaise: refund,
+        });
       }
     }
 

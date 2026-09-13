@@ -172,7 +172,7 @@ test('a genuinely signed payment is accepted, and a subsequently unreachable nod
   });
   assert.equal(res.status, 409, 'no worker connected -- the node commit must fail');
   const body = await res.json();
-  assert.equal(body.refunded, true);
+  assert.equal(body.refund_status, 'refunded');
 
   assert.equal(fakeGateway.refunds.length, 1);
   assert.deepEqual(fakeGateway.refunds[0], { paymentId, amountPaise: 4300 });
