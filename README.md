@@ -198,10 +198,38 @@ Phase 1, early. What exists and is tested:
   this app recognizes with no router), submitted a new password through
   the real form, and confirmed via the API that the old password now
   fails and the new one works.
+- `backend/src/jobs/verification.js` + `machine.js`'s `DISPUTED` state —
+  result verification via duplicate execution, the master brief's own
+  answer to `docs/security-model.md`'s previously-unaddressed "Direction 2"
+  (a provider lying about a job's result). `POST /reservations/:id/jobs`
+  takes an optional `verify_against_reservation_id` -- a second,
+  independently booked reservation on a *different* node -- runs the
+  identical job on both, and compares SHA-256 hashes of the results once
+  both finish. A match settles normally; a mismatch disputes **both**
+  reservations (full refund) rather than trusting either, since two nodes
+  disagreeing proves at least one is wrong but never which -- reputation is
+  deliberately left untouched for both on a dispute, stated explicitly
+  rather than silently guessed at. Opt-in and manual, not automatic: this
+  is the *mechanism*, not a policy that decides which jobs need it. Tested
+  against a real `Hub` with genuine Ed25519-signed receipts and real
+  Postgres (including graceful degradation when the second node's
+  submission fails), and verified live with two real worker processes
+  running two real Docker containers on independent nodes -- their
+  matching output hashed identically and both bookings settled with the
+  exact 90/10 split. See `docs/security-model.md`'s Direction 2 section for
+  what this does and does not solve (it detects disagreement, not fault; a
+  match is agreement, not proof of correctness; nothing here stops a node
+  from reading a user's code, only from lying about the result undetected).
+  Caught along the way: the Postgres CHECK constraint on
+  `reservations.status` was a second, independent definition of "which
+  states are legal" that had drifted from `machine.js`'s own list --
+  adding `DISPUTED` to one without the other meant every dispute attempt
+  failed with a constraint violation the first time it actually ran.
 
-Not built yet: P2P discovery beyond one platform-worker link, and
-protecting users from malicious providers (no result verification /
-duplicate execution yet).
+Not built yet: P2P discovery beyond one platform-worker link, a policy that
+decides *automatically* which jobs warrant duplicate-execution
+verification, and a real dispute-resolution process that can attribute
+fault beyond "at least one of these two nodes is wrong."
 
 ## Running
 
@@ -212,7 +240,7 @@ for f in backend/migrations/*.sql; do
   docker compose exec -T postgres psql -U nodeva -d nodeva < "$f"
 done
 
-# backend tests (140) -- JWT_SECRET only needed by tests that build the full
+# backend tests (161) -- JWT_SECRET only needed by tests that build the full
 # app (server.js); the unit test files don't call createApp() so most pass
 # without it, but set it anyway to be safe. Several suites (reconciler,
 # reputation-integration, dashboard, payment-flow, account-recovery)

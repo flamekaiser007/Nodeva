@@ -53,22 +53,57 @@ explicitly accept the residual risk.
 
 ## Direction 2: the provider attacks the user
 
-This direction has **no sandbox-side mitigation at all**, and it is easy to
-forget because the sandbox work is where all the interesting engineering is.
-A provider that controls the machine can read the user's code and input data
-in full, tamper with results before returning them, or simply lie about
-having run the job at all.
+A provider that controls the machine can read the user's code and input
+data in full, tamper with results before returning them, or simply lie
+about having run the job at all. This direction has **no sandbox-side
+mitigation at all** — nothing in Direction 1's controls touches it, since
+they all assume the node itself is the thing being defended against a
+hostile *workload*, not a node that is itself hostile.
 
-Nothing built so far in this repository addresses this. The master project
-brief's answers — selective duplicate execution with hash comparison for
-high-value or untrusted-provider jobs, provider reputation, and eventually
-verifiable computation — are Phase 4/5 work and are explicitly not attempted
-here. **Anyone submitting genuinely sensitive code or data to this MVP should
-be told that in plain language**, not left to infer it from the absence of a
-feature.
+**Partially addressed now**, not solved: `backend/src/jobs/verification.js`
+implements the master brief's own answer — selective duplicate execution.
+`POST /reservations/:id/jobs` accepts an optional
+`verify_against_reservation_id`: a second, independently booked and
+confirmed reservation on a *different* node, given the identical workload,
+with results compared by SHA-256 hash once both finish. A match settles
+both normally; a mismatch disputes both (full refund, see `machine.js`'s
+`DISPUTED` state) rather than trusting either.
+
+State the limits precisely, because they are easy to overstate:
+
+- **This detects disagreement. It does not attribute fault.** Two nodes
+  disagreeing proves at least one is wrong, never which — `reputation.js`
+  deliberately leaves both untouched on a dispute rather than guessing.
+  Real fault attribution needs a third node (majority vote) or a much
+  harder verifiable-computation approach; neither exists here.
+- **A match is agreement, not proof of correctness.** Two colluding
+  malicious nodes pass cleanly. This raises the cost of cheating
+  (compromise or collude with two independent operators, not one) — it does
+  not eliminate it.
+- **It is opt-in and manual**, not automatic. Nothing decides *for* the
+  user that a job is valuable enough, or a provider untrusted enough, to
+  warrant paying for two nodes instead of one — a policy that triggers this
+  automatically (new providers, high-value jobs) is exactly the "provider
+  reputation" and "selective" parts of the master brief's answer that
+  remain unbuilt.
+- **It doubles cost and still doesn't cover reading.** A malicious node can
+  still read a user's code and input data even if verification later
+  catches it lying about the output — nothing here is confidentiality.
+  Verifiable computation (Phase 4/5 per the master roadmap) is the only
+  real answer to that, and is not attempted.
+
+Verified: the comparison and settlement logic is proven against a real
+`Hub` with genuinely Ed25519-signed receipts and real Postgres
+(`test/verification-flow.test.js`), and separately against two actual
+worker processes running two actual Docker containers on independent
+nodes, whose real (matching) `stdout` hashed identically and settled
+correctly with the exact 90/10 split on both bookings.
 
 ## What this means for the MVP
 
 Ship Direction 1's controls now (they are cheap, mechanical, and testable).
-Be honest that Direction 2 is unsolved. Do not describe the platform as
-"secure" without naming which direction that claim covers.
+Direction 2 is now partially, honestly addressed for the specific case of
+"can I tell if a provider lied about a result" — not for confidentiality,
+not automatically, and not with fault attribution. Do not describe the
+platform as "secure" without naming which direction, and how much of it,
+that claim covers.

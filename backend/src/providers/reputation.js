@@ -12,6 +12,14 @@
 // 'expired' and 'cancelled' are booking-level outcomes where no job ever
 // ran -- there is no signal about the node's behavior either way, so they
 // are deliberately excluded rather than mapped to a default.
+//
+// 'disputed' (jobs/verification.js's duplicate-execution result) is
+// excluded for a different reason: two independent nodes disagreeing PROVES
+// at least one of them is wrong, but not which -- there is no principled
+// way to move a specific node's counters from a two-sample disagreement
+// alone. Punishing both would be unfair to whichever one was honest;
+// punishing neither is the only defensible default until a real
+// dispute-resolution process (a third node, say) can attribute fault.
 const EFFECT = {
   completed: 'success',
   failed_user: 'success',       // the node did its job; the workload was bad

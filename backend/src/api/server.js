@@ -26,6 +26,13 @@ import {
   createGatewayFromEnv, verifyPaymentSignature, verifyWebhookSignature,
 } from '../payments/razorpay.js';
 import { issueRefund } from '../payments/refunds.js';
+import { computeResultHash, compareJobResults, groupIsComplete } from '../jobs/verification.js';
+
+// Job-level (not reservation-level) terminal statuses -- see the schema's
+// CHECK constraint on jobs.status. Used only to decide when a verification
+// group is ready to compare, not for any settlement logic itself.
+const TERMINAL_JOB_STATUSES = new Set(
+  ['succeeded', 'failed_user', 'failed_provider', 'timed_out', 'cancelled']);
 
 // A REAL bcrypt hash of a fixed, never-used value -- not a made-up string.
 // login compares against this when the email does not exist, so bcrypt does
@@ -104,29 +111,45 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
     // Arrives asynchronously, any time after JOB_ACCEPTED -- possibly hours
     // later for a real workload. Maps the executor's outcome to a reservation
     // settlement outcome and runs real money through settleReservation, the
-    // same function the manual /complete endpoint uses.
+    // same function the manual /complete endpoint uses. A job submitted with
+    // duplicate-execution verification (jobs/verification.js) takes a
+    // different path: settlement waits until BOTH nodes in its group have
+    // reported in, then compares their results before either reservation
+    // is allowed to settle.
     onJobResult: async (nodeId, msg) => {
       try {
+        const resultHash = computeResultHash({
+          status: mapJobStatus(msg.status), exit_code: msg.exit_code,
+          stdout: msg.stdout, stderr: msg.stderr,
+        });
         const { rows } = await pool.query(
           `UPDATE jobs SET status=$2, exit_code=$3, compute_seconds=$4,
-                  stdout=$5, stderr=$6, completed_at=now()
-             WHERE job_id=$1 RETURNING reservation_id`,
+                  stdout=$5, stderr=$6, completed_at=now(), result_hash=$7
+             WHERE job_id=$1 RETURNING reservation_id, verification_group_id`,
           [msg.job_id, mapJobStatus(msg.status), msg.exit_code,
-           Math.round(msg.duration_seconds ?? 0), msg.stdout ?? null, msg.stderr ?? null]);
-        const reservationId = rows[0]?.reservation_id;
-        if (!reservationId) {
+           Math.round(msg.duration_seconds ?? 0), msg.stdout ?? null, msg.stderr ?? null, resultHash]);
+        const jobRow = rows[0];
+        if (!jobRow) {
           console.error(`JOB_RESULT for unknown job ${msg.job_id}`);
           return;
         }
-        const outcome = jobStatusToSettlement(msg.status);
-        const result = await settleReservation(pool, reservationId, outcome, Math.round(msg.duration_seconds ?? 0), razorpay);
-        // settleReservation reports problems by RETURNING an {error} object,
-        // not by throwing -- the catch block below does not see these. This
-        // is exactly the shape of bug that left a reservation stuck at
-        // 'confirmed' forever with no log line the first time this ran.
-        if (result.error) {
-          console.error(`settlement failed for reservation ${reservationId} (job ${msg.job_id}): ${result.error}`);
+
+        if (!jobRow.verification_group_id) {
+          const outcome = jobStatusToSettlement(msg.status);
+          const result = await settleReservation(
+            pool, jobRow.reservation_id, outcome, Math.round(msg.duration_seconds ?? 0), razorpay);
+          // settleReservation reports problems by RETURNING an {error}
+          // object, not by throwing -- the catch block below does not see
+          // these. This is exactly the shape of bug that left a reservation
+          // stuck at 'confirmed' forever with no log line the first time
+          // this ran.
+          if (result.error) {
+            console.error(`settlement failed for reservation ${jobRow.reservation_id} (job ${msg.job_id}): ${result.error}`);
+          }
+          return;
         }
+
+        await settleVerificationGroup(pool, razorpay, jobRow.verification_group_id);
       } catch (e) {
         // Money must not silently fail to settle. This is exactly the class
         // of drift docs/reservation-protocol.md's reconciler exists for; for
@@ -733,6 +756,14 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   // Submit a job against a CONFIRMED reservation. Resolves once the node has
   // started the container -- not when the job finishes, which may be hours
   // later and arrives asynchronously via onJobResult below.
+  // Pass verify_against_reservation_id (a second, separately booked and
+  // confirmed reservation the SAME user already owns, on a DIFFERENT node)
+  // to run this identical job on both and compare results --
+  // docs/security-model.md's Direction 2 (protecting the user from a
+  // malicious or lying provider). Opt-in and manual by design: nothing here
+  // decides automatically that a job is worth the doubled cost of running
+  // twice, see jobs/verification.js's file header for the honest limits of
+  // what two-node comparison can and cannot prove.
   app.post('/reservations/:id/jobs', auth, async (req, res, next) => {
     try {
       const { rows } = await pool.query(
@@ -743,8 +774,33 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
         return res.status(409).json({ error: `reservation is ${resv.status}, not confirmed` });
       }
 
+      const { image, command, env, gpu, verify_against_reservation_id } = req.body;
+
+      let sibling = null;
+      if (verify_against_reservation_id) {
+        const siblingRows = await pool.query(
+          'SELECT * FROM reservations WHERE reservation_id = $1', [verify_against_reservation_id]);
+        sibling = siblingRows.rows[0];
+        if (!sibling || sibling.user_id !== req.userId) {
+          return res.status(404).json({ error: 'verify_against_reservation_not_found' });
+        }
+        if (sibling.status !== S.CONFIRMED) {
+          return res.status(409).json({ error: `verification reservation is ${sibling.status}, not confirmed` });
+        }
+        if (sibling.node_id === resv.node_id) {
+          // Comparing a node against itself proves nothing -- a single
+          // compromised or buggy node would agree with its own lie every time.
+          return res.status(400).json({ error: 'verification requires two different nodes' });
+        }
+        const siblingJobRows = await pool.query(
+          'SELECT 1 FROM jobs WHERE reservation_id = $1', [verify_against_reservation_id]);
+        if (siblingJobRows.rows[0]) {
+          return res.status(409).json({ error: 'verification reservation already has a job' });
+        }
+      }
+
       const jobId = crypto.randomUUID();
-      const { image, command, env, timeout_seconds, gpu } = req.body;
+      const verificationGroupId = sibling ? crypto.randomUUID() : null;
 
       try {
         await hub.submitJob(resv.node_id, {
@@ -758,9 +814,9 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
       }
 
       await pool.query(
-        `INSERT INTO jobs (job_id, reservation_id, image, command, status, started_at)
-         VALUES ($1,$2,$3,$4,'running',now())`,
-        [jobId, resv.reservation_id, image, command]);
+        `INSERT INTO jobs (job_id, reservation_id, image, command, status, started_at, verification_group_id)
+         VALUES ($1,$2,$3,$4,'running',now(),$5)`,
+        [jobId, resv.reservation_id, image, command, verificationGroupId]);
       // The reservation lifecycle requires confirmed -> running -> completed
       // (see reservations/machine.js); settleReservation later transitions
       // FROM 'running', so skipping this step leaves it stuck at 'confirmed'
@@ -769,7 +825,40 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
         "UPDATE reservations SET status='running', updated_at=now() WHERE reservation_id=$1",
         [resv.reservation_id]);
 
-      res.status(202).json({ job_id: jobId, status: 'running' });
+      let siblingJobId = null;
+      let verificationDegraded = false;
+      if (sibling) {
+        siblingJobId = crypto.randomUUID();
+        try {
+          await hub.submitJob(sibling.node_id, {
+            jobId: siblingJobId, reservationId: sibling.reservation_id, image, command, env, gpu,
+          });
+          await pool.query(
+            `INSERT INTO jobs (job_id, reservation_id, image, command, status, started_at, verification_group_id)
+             VALUES ($1,$2,$3,$4,'running',now(),$5)`,
+            [siblingJobId, sibling.reservation_id, image, command, verificationGroupId]);
+          await pool.query(
+            "UPDATE reservations SET status='running', updated_at=now() WHERE reservation_id=$1",
+            [sibling.reservation_id]);
+        } catch (e) {
+          // Graceful degradation, not a hard failure: the first job is
+          // ALREADY running by this point (its JOB_ACCEPTED already came
+          // back). Strip its verification_group_id so onJobResult settles
+          // it normally, solo, once it finishes -- rather than leaving it
+          // waiting forever for a sibling that will never arrive.
+          await pool.query('UPDATE jobs SET verification_group_id = NULL WHERE job_id = $1', [jobId]);
+          verificationDegraded = true;
+          siblingJobId = null;
+          console.warn(
+            `verification sibling submission failed for reservation ${verify_against_reservation_id} -- ` +
+            `job ${jobId} continues solo, unverified:`, e.message ?? e);
+        }
+      }
+
+      res.status(202).json({
+        job_id: jobId, status: 'running',
+        ...(sibling ? { verification_degraded: verificationDegraded, sibling_job_id: siblingJobId } : {}),
+      });
     } catch (e) { next(e); }
   });
 
@@ -839,6 +928,58 @@ function jobStatusToSettlement(execStatus) {
     oom_killed: 'failed_user',
     error: 'failed_provider',
   }[execStatus] ?? 'failed_provider';
+}
+
+// A THIRD vocabulary, distinct from both of the above -- settleVerification
+// Group reads jobs.status back OUT of the database, which already holds
+// mapJobStatus's OUTPUT ('succeeded'/'failed_user'/'failed_provider'), not
+// the raw executor status jobStatusToSettlement expects. Feeding
+// jobs.status into jobStatusToSettlement would look up a key that function
+// never defines ('failed_user' is not one of ITS keys) and silently fall
+// through to 'failed_provider' regardless of what actually happened --
+// caught here specifically because it is the same class of vocabulary-
+// conflation bug documented above, not a new kind of mistake.
+function jobRowStatusToOutcome(jobStatus) {
+  return {
+    succeeded: 'completed',
+    failed_user: 'failed_user',
+    failed_provider: 'failed_provider',
+    timed_out: 'failed_user',
+    cancelled: 'failed_provider',
+  }[jobStatus] ?? 'failed_provider';
+}
+
+// The settlement side of duplicate-execution verification
+// (jobs/verification.js): once every job sharing a verification_group_id
+// has reached a terminal status, compares their results and settles BOTH
+// reservations together -- a match settles each on its own outcome (no
+// different from an unverified job), a mismatch disputes both in full,
+// since two nodes disagreeing proves at least one is wrong but not which
+// (see machine.js's DISPUTED state and reputation.js's handling of it).
+async function settleVerificationGroup(pool, paymentGateway, groupId) {
+  const { rows: jobs } = await pool.query(
+    'SELECT job_id, reservation_id, status, result_hash, compute_seconds FROM jobs WHERE verification_group_id = $1',
+    [groupId]);
+  if (!groupIsComplete(jobs, TERMINAL_JOB_STATUSES)) return; // the sibling hasn't finished yet
+
+  const verdict = compareJobResults(jobs[0], jobs[1]);
+  const settleAs = verdict === 'match'
+    ? (job) => jobRowStatusToOutcome(job.status)
+    : () => S.DISPUTED;
+
+  if (verdict === 'mismatch') {
+    console.warn(
+      `verification group ${groupId} MISMATCHED (jobs ${jobs.map((j) => j.job_id).join(', ')}) ` +
+      `-- disputing both reservations, refunding in full. Cannot attribute fault from two samples alone.`);
+  }
+
+  for (const job of jobs) {
+    const result = await settleReservation(
+      pool, job.reservation_id, settleAs(job), job.compute_seconds ?? 0, paymentGateway);
+    if (result.error) {
+      console.error(`verification-group settlement failed for reservation ${job.reservation_id}: ${result.error}`);
+    }
+  }
 }
 
 // The node+escrow half of confirming a reservation: commit the node's hold

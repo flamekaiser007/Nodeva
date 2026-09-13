@@ -19,6 +19,14 @@ export const S = {
   EXPIRED: 'expired',                   // node's hold TTL elapsed before we paid
   FAILED_PROVIDER: 'failed_provider',
   FAILED_USER: 'failed_user',
+  // Reached only by a job submitted with duplicate-execution verification
+  // (see jobs/verification.js) whose two independent nodes disagreed on the
+  // result. Deliberately NOT the same as failed_provider: that state
+  // asserts we know the node is at fault; a two-node disagreement only
+  // proves at least one of them is wrong, not which -- see
+  // docs/security-model.md's "Direction 2" section for why this is an
+  // honest half-measure, not a solved problem.
+  DISPUTED: 'disputed',
 };
 
 // Explicit edge list. Anything absent is a bug, not an edge case — we would
@@ -27,12 +35,13 @@ const EDGES = {
   [S.PENDING]:   [S.HELD, S.EXPIRED, S.CANCELLED],
   [S.HELD]:      [S.CONFIRMED, S.EXPIRED, S.CANCELLED],
   [S.CONFIRMED]: [S.RUNNING, S.CANCELLED, S.FAILED_PROVIDER],
-  [S.RUNNING]:   [S.COMPLETED, S.FAILED_PROVIDER, S.FAILED_USER],
+  [S.RUNNING]:   [S.COMPLETED, S.FAILED_PROVIDER, S.FAILED_USER, S.DISPUTED],
   [S.COMPLETED]: [],
   [S.CANCELLED]: [],
   [S.EXPIRED]: [],
   [S.FAILED_PROVIDER]: [],
   [S.FAILED_USER]: [],
+  [S.DISPUTED]: [],
 };
 
 export const TERMINAL = new Set(
@@ -63,4 +72,11 @@ export const SETTLEMENT = {
   [S.FAILED_PROVIDER]: 'refund_full',
   [S.EXPIRED]:         'refund_full',    // never charged; release authorization
   [S.CANCELLED]:       'refund_per_policy',
+  // A disputed result is refunded in full on the same reasoning as
+  // failed_provider: the user did not get a workload they can trust, and
+  // with only two samples we cannot bill them for a result that might be
+  // the fabricated one. This is deliberately generous to the user over the
+  // (possibly innocent) provider, which is the correct default until a
+  // real dispute-resolution process can attribute fault.
+  [S.DISPUTED]:        'refund_full',
 };

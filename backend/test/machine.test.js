@@ -66,3 +66,22 @@ test('metered charge on user failure is floored and capped', () => {
   // Ran nearly the full hour then failed: never exceed what was quoted.
   assert.equal(meteredCharge(quoted, 4300, 3599), quoted);
 });
+
+test('a running job can be disputed (two-node verification disagreed)', () => {
+  assert.equal(canTransition(S.RUNNING, S.DISPUTED), true);
+});
+
+test('disputed is terminal, same as every other end state', () => {
+  assert.ok(TERMINAL.has(S.DISPUTED));
+});
+
+test('a disputed job refunds in full, same reasoning as a provider failure', () => {
+  assert.equal(SETTLEMENT[S.DISPUTED], 'refund_full');
+});
+
+test('only a running job can become disputed -- not held or confirmed', () => {
+  // Disputing requires two results to actually compare; a reservation that
+  // never got as far as running a job has nothing to dispute.
+  assert.equal(canTransition(S.HELD, S.DISPUTED), false);
+  assert.equal(canTransition(S.CONFIRMED, S.DISPUTED), false);
+});
