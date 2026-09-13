@@ -16,6 +16,7 @@ import { searchCandidates } from '../marketplace/nodeStore.js';
 import { rank } from '../marketplace/scheduler.js';
 import { quote, split, meteredCharge } from '../payments/settle.js';
 import { S, canTransition, SETTLEMENT } from '../reservations/machine.js';
+import { expireStaleHolds } from '../reservations/reconciler.js';
 import { hashPassword, verifyPassword } from '../auth/password.js';
 import { requireJwtSecret, signSession } from '../auth/jwt.js';
 import { requireAuth } from '../auth/middleware.js';
@@ -256,6 +257,16 @@ export function createApp(pool) {
     const { node_id, starts_at, ends_at } = req.body;
     const user_id = req.userId;
     try {
+      // Opportunistic reconciliation before touching the exclusion
+      // constraint: a hold the node already gave up on (its TTL elapsed)
+      // but that the platform never got around to expiring would otherwise
+      // block this exact booking with a false conflict -- confirmed by
+      // hand: the node happily signs a fresh receipt for the "conflicting"
+      // window, which then goes nowhere because our own stale row rejects
+      // the insert. Scoped to this node so it stays cheap on a hot path;
+      // the periodic sweep in index.js catches everything else.
+      await expireStaleHolds(pool, { nodeId: node_id });
+
       const nodeRow = await pool.query(
         'SELECT price_paise_hr FROM compute_nodes WHERE node_id = $1', [node_id]);
       if (!nodeRow.rows[0]) return res.status(404).json({ error: 'unknown node' });

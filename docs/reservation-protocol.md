@@ -57,17 +57,51 @@ charged. This is why `expired → confirmed` is an illegal transition in
 | Node rejects (slot taken) | free | `pending → cancelled` | offered alternatives, never charged |
 | Platform crashes pre-capture | lock expires via TTL | `held → expired` | not charged |
 | Gateway declines | lock expires via TTL | `held → expired` | not charged |
-| `RESERVE_COMMIT` lost in flight | lock expires via TTL | `confirmed` | **drift — reconciler must refund** |
+| User abandons a `held` reservation (never confirms) | lock expires via TTL | **was stuck at `held` forever — see below** | not charged, but see below |
+| `RESERVE_COMMIT` ack lost after the node applied it | **permanently confirmed, no TTL** | `held → expired` (the confirm handler treats any timeout/disconnect as failure) | not charged, but see below |
 | Node vanishes mid-job | — | `running → failed_provider` | full refund |
 | User's code throws | — | `running → failed_user` | billed for compute consumed |
 
-The fourth row is the one that matters. It is the only state where we hold money
-for a slot the node has released, so it cannot be left to chance: a reconciler
-sweeps `confirmed` reservations whose node never acknowledged the commit and
-refunds them. Everything else is self-healing.
+Row four was a real, shipped bug, not a hypothetical: a reservation nobody
+ever confirmed just sat in `held` in Postgres indefinitely, even after the
+node's own hold TTL had elapsed and freed the slot locally. The GiST
+exclusion constraint then treated that stale row as still occupying the
+window — a second attempt to book the *same, actually-free* slot was
+rejected with a false conflict, confirmed by hand: the node signed a brand
+new receipt for the "conflicting" window, which the platform then discarded
+because its own stale row blocked the insert. Fixed by
+`backend/src/reservations/reconciler.js`'s `expireStaleHolds`, run
+opportunistically (scoped to one node, right before a booking attempt that
+might collide with a stale hold of its own) and on a periodic sweep (every
+15s, unscoped, catching abandoned holds nobody happens to retry). Neither
+path involves money — nothing is captured until `confirm`, so this is a slot
+being falsely reported unavailable, not a billing error.
+
+Row five is the case that would need a refund if it ever produced a mismatch
+long enough to matter, but by construction it currently cannot silently cost
+anyone money: the confirm handler treats *any* timeout or disconnect while
+waiting for `COMMITTED` as a failure and marks the reservation `expired`
+without ever capturing payment — see the `node_unreachable_hold_not_confirmed`
+path in `server.js`. The residual risk is a pure state *mismatch*, not a
+financial one: the node may have actually applied the commit permanently
+(no TTL) while the platform believes the slot is free again. A second user
+attempting to book that window is safely, correctly denied by the node
+itself (a real conflict, not a false one this time) — the awkward outcome is
+that the first user is told their booking expired when the node would in
+fact have run their job, and has no way to retry it since the slot now
+reads as taken. No money changes hands incorrectly, but the user experience
+is broken. Resolving it needs the platform to be able to *ask* a node "is
+reservation X actually confirmed on your side?" — a query this protocol does
+not have yet, tracked in "what is not solved" below.
 
 ## What is NOT solved yet
 
+- **Reconciliation query.** There is no `RESERVATION_STATUS?` message a
+  platform can send a node to ask "what do you actually show for X" after a
+  commit ack goes missing. Today that mismatch resolves itself safely
+  (double-booking stays impossible) but leaves the affected user stuck with
+  no path to their own confirmed slot. Low-frequency edge case, real UX cost
+  when it happens.
 - **Byzantine nodes.** A node can sign a receipt and then simply not run the
   job. Detection today is the heartbeat; the economic answer is reputation plus
   selective duplicate execution, not cryptography.

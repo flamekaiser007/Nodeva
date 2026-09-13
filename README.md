@@ -83,10 +83,23 @@ Phase 1, early. What exists and is tested:
   `user_id`/`provider_id` now derives it from the verified token instead;
   `/reservations/:id/confirm`, `/jobs`, and `/complete` also check that the
   caller owns the reservation before acting on it or returning its data.
+- `backend/src/reservations/reconciler.js` — fixes a real shipped bug: a
+  reservation nobody ever confirmed used to sit `held` in Postgres forever,
+  even after the node's own hold TTL freed the slot locally, so the GiST
+  exclusion constraint falsely rejected a later booking of that same,
+  actually-free slot. Reproduced against a live worker, fixed, and pinned by
+  a test that fails the same way the bug did before the fix (a real INSERT
+  against a real exclusion constraint, not a mock). Runs opportunistically
+  before a booking attempt and on a 15s sweep. See
+  [docs/reservation-protocol.md](docs/reservation-protocol.md)'s failure
+  matrix for the one related case that's still open.
 
 Not built yet: account recovery (forgot-password, email verification), P2P
 discovery beyond one platform-worker link, protecting users from malicious
-providers (no result verification / duplicate execution yet).
+providers (no result verification / duplicate execution yet), and a
+reservation-status query a platform could use to resolve the one documented
+node/platform state mismatch that can still leave a user stuck (safe -- no
+money or double-booking risk, just a stuck UX).
 
 ## Running
 
@@ -97,9 +110,11 @@ for f in backend/migrations/*.sql; do
   docker compose exec -T postgres psql -U nodeva -d nodeva < "$f"
 done
 
-# backend tests (61) -- JWT_SECRET only needed by tests that build the full
+# backend tests (66) -- JWT_SECRET only needed by tests that build the full
 # app (server.js); the unit test files don't call createApp() so most pass
-# without it, but set it anyway to be safe
+# without it, but set it anyway to be safe. reconciler.test.js additionally
+# needs a reachable Postgres (docker compose up -d postgres) and skips
+# cleanly if there isn't one.
 export JWT_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
 cd backend && node --test test/*.test.js
 
