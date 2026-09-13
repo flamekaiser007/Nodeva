@@ -7,9 +7,9 @@ import pg from 'pg';
 // this schema — just not pg's default.
 pg.types.setTypeParser(20 /* int8 */, (val) => parseInt(val, 10));
 
-export function createPool(connectionString = process.env.DATABASE_URL) {
+export function createPool(connectionString = process.env.DATABASE_URL, options = {}) {
   if (!connectionString) {
     throw new Error('DATABASE_URL is not set');
   }
-  return new pg.Pool({ connectionString });
+  return new pg.Pool({ connectionString, ...options });
 }

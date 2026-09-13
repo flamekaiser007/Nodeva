@@ -214,6 +214,17 @@ PROVIDER_SUM=$(docker compose exec -T postgres psql -U nodeva -d nodeva -t -A -c
   "SELECT SUM(amount_paise) FROM ledger_entries e JOIN ledger_accounts a USING(account_id) WHERE kind='provider_balance';")
 [ "$PROVIDER_SUM" = "3870" ] || { echo "FAIL: provider should have 3870, got $PROVIDER_SUM"; exit 1; }
 
+echo "== the completed job actually updated the provider's reputation =="
+# rep_jobs_total/rep_jobs_failed used to be read by the scheduler and never
+# written anywhere -- every provider's computed reliability was permanently
+# stuck at the neutral default. Confirms the real job that just ran moved a
+# real counter, not just that the settlement math above balanced.
+REP=$(docker compose exec -T postgres psql -U nodeva -d nodeva -t -A -c \
+  "SELECT rep_jobs_total || ',' || rep_jobs_failed FROM providers p
+     JOIN compute_nodes n ON n.provider_id = p.provider_id WHERE n.node_id='$NODE';")
+[ "$REP" = "1,0" ] || { echo "FAIL: expected rep_jobs_total=1,rep_jobs_failed=0 after one completed job, got $REP"; exit 1; }
+echo "OK: $REP"
+
 echo "== killing the worker: node must drop offline and out of search =="
 kill "$WORKER_PID"; unset WORKER_PID
 sleep 1

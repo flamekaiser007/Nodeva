@@ -4,16 +4,21 @@
 // of a real database actually exercises.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import pg from 'pg';
+import { createPool } from '../src/db/pool.js';
 import { expireStaleHolds } from '../src/reservations/reconciler.js';
 
 const DATABASE_URL = process.env.DATABASE_URL
   ?? 'postgresql://nodeva:nodeva_dev@localhost:5433/nodeva';
 
+// Routes through createPool so the process-wide BIGINT type parser (see
+// db/pool.js) is registered before any query touching a paise column runs --
+// a test file that built its own `new pg.Pool(...)` here would silently get
+// BIGINT columns back as strings instead of numbers, which is exactly the
+// bug that first surfaced in this file's own settleReservation calls.
 let pool;
 let dbAvailable = false;
 try {
-  pool = new pg.Pool({ connectionString: DATABASE_URL, connectionTimeoutMillis: 2000 });
+  pool = createPool(DATABASE_URL, { connectionTimeoutMillis: 2000 });
   await pool.query('SELECT 1');
   dbAvailable = true;
 } catch {

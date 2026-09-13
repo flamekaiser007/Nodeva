@@ -93,6 +93,20 @@ Phase 1, early. What exists and is tested:
   before a booking attempt and on a 15s sweep. See
   [docs/reservation-protocol.md](docs/reservation-protocol.md)'s failure
   matrix for the one related case that's still open.
+- `backend/src/providers/reputation.js` — another shipped-but-silent gap:
+  `providers.rep_jobs_total`/`rep_jobs_failed` were read by the scheduler's
+  reliability ranking (`marketplace/nodeStore.js`) but never written by
+  anything, ever -- every provider's computed reliability was permanently
+  stuck at the neutral 0.8 default regardless of actual outcomes. Fixed by
+  updating both counters on every settlement, with a policy worth stating
+  explicitly: the user's own workload failing does NOT count against the
+  provider that faithfully ran it, and a booking that expires or is
+  cancelled before any job runs carries no reputation signal at all --
+  only `completed` and `failed_provider` move the numbers, in the direction
+  that actually reflects whether the node upheld its end. Verified against
+  real Postgres that the write path (settlement) and read path (the
+  scheduler's reliability formula) agree exactly, and against the live e2e
+  stack that a real container run moves a real counter for the first time.
 
 Not built yet: account recovery (forgot-password, email verification), P2P
 discovery beyond one platform-worker link, protecting users from malicious
@@ -110,11 +124,11 @@ for f in backend/migrations/*.sql; do
   docker compose exec -T postgres psql -U nodeva -d nodeva < "$f"
 done
 
-# backend tests (66) -- JWT_SECRET only needed by tests that build the full
+# backend tests (76) -- JWT_SECRET only needed by tests that build the full
 # app (server.js); the unit test files don't call createApp() so most pass
-# without it, but set it anyway to be safe. reconciler.test.js additionally
-# needs a reachable Postgres (docker compose up -d postgres) and skips
-# cleanly if there isn't one.
+# without it, but set it anyway to be safe. reconciler.test.js and
+# reputation-integration.test.js additionally need a reachable Postgres
+# (docker compose up -d postgres) and skip cleanly if there isn't one.
 export JWT_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
 cd backend && node --test test/*.test.js
 

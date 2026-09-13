@@ -17,6 +17,7 @@ import { rank } from '../marketplace/scheduler.js';
 import { quote, split, meteredCharge } from '../payments/settle.js';
 import { S, canTransition, SETTLEMENT } from '../reservations/machine.js';
 import { expireStaleHolds } from '../reservations/reconciler.js';
+import { reputationEffect } from '../providers/reputation.js';
 import { hashPassword, verifyPassword } from '../auth/password.js';
 import { requireJwtSecret, signSession } from '../auth/jwt.js';
 import { requireAuth } from '../auth/middleware.js';
@@ -536,7 +537,7 @@ function jobStatusToSettlement(execStatus) {
 // onJobResult once a real job finishes. Returns a plain result object rather
 // than writing to `res` directly, so callers that are not HTTP handlers (the
 // hub's job-result callback) can use it identically.
-async function settleReservation(pool, reservationId, outcome, computeSeconds) {
+export async function settleReservation(pool, reservationId, outcome, computeSeconds) {
   const client = await pool.connect();
   try {
     const { rows } = await client.query(
@@ -589,6 +590,24 @@ async function settleReservation(pool, reservationId, outcome, computeSeconds) {
     await client.query(
       'UPDATE reservations SET status=$2, updated_at=now() WHERE reservation_id=$1',
       [resv.reservation_id, outcome]);
+
+    // providers.rep_jobs_total/rep_jobs_failed were being read by the
+    // scheduler (marketplace/nodeStore.js) and NEVER written anywhere --
+    // every provider's computed reliability was permanently stuck at the
+    // neutral default (0.8) regardless of how many jobs actually succeeded
+    // or failed. See src/providers/reputation.js for the policy: only
+    // outcomes where a job actually ran on the node move these counters,
+    // and the user's own workload failing does not count against the
+    // provider that faithfully ran it.
+    const effect = reputationEffect(outcome);
+    if (effect) {
+      await client.query(
+        `UPDATE providers SET rep_jobs_total = rep_jobs_total + 1,
+                rep_jobs_failed = rep_jobs_failed + $2
+          WHERE provider_id = $1`,
+        [providerId, effect === 'failure' ? 1 : 0]);
+    }
+
     await client.query('COMMIT');
 
     return { reservation_id: resv.reservation_id, status: outcome,
