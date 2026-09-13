@@ -311,6 +311,18 @@ Phase 1, early. What exists and is tested:
   `dispute-resolution.test.js`'s scripted-worker tests rather than live
   here, since manufacturing a live one requires an intentionally lying
   worker -- the same honest tradeoff the automated suite exists to cover.
+- **Closed the job-recovery gap the previous commit left open.** `GET
+  /reservations/:id` now also returns the reservation's own job (most
+  recent, if any), so `VerifiedPairReservation`'s remount-hydration effect
+  can recover an in-flight or finished job's `job_id` instead of just its
+  reservation status -- a mount that finds the job still running resumes
+  polling it (shared `pollJob` helper, used by both a fresh submission and
+  recovery so the two paths can't drift); one that finds it already
+  terminal shows the result directly. Verified live: submitted a job with
+  a 5-second `sleep`, switched to "Share GPU" and back mid-run, and watched
+  it correctly resume tracking to a `completed` settlement with the real
+  stdout, where before this fix the same sequence would have shown "can't
+  resume showing its progress."
 
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need

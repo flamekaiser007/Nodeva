@@ -552,13 +552,24 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   // still reports its own outcome (e.g. 'succeeded') even when the
   // RESERVATION was disputed by a verification mismatch, since the two are
   // genuinely different vocabularies (see jobRowStatusToOutcome's comment).
+  // Includes the reservation's own job (if any), most-recent first -- a
+  // client that remounts (a tab switch, a page reload) has no other way to
+  // recover which job_id belongs to this reservation, since nothing else
+  // persists that mapping outside whatever component last held it in
+  // memory. Application logic (POST .../jobs) refuses a second job on an
+  // already-jobbed reservation, so in practice this is always at most one
+  // row; LIMIT 1 is defensive, not load-bearing.
   app.get('/reservations/:id', auth, async (req, res, next) => {
     try {
       const { rows } = await pool.query(
         'SELECT * FROM reservations WHERE reservation_id = $1 AND user_id = $2',
         [req.params.id, req.userId]);
-      if (!rows[0]) return res.status(404).json({ error: 'not_found' });
-      res.json(rows[0]);
+      const resv = rows[0];
+      if (!resv) return res.status(404).json({ error: 'not_found' });
+      const jobRows = await pool.query(
+        'SELECT * FROM jobs WHERE reservation_id = $1 ORDER BY created_at DESC LIMIT 1',
+        [req.params.id]);
+      res.json({ ...resv, job: jobRows.rows[0] ?? null });
     } catch (e) { next(e); }
   });
 

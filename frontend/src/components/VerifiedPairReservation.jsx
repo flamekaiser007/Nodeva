@@ -42,6 +42,37 @@ export default function VerifiedPairReservation({ pair, onSettled }) {
 
   useEffect(() => () => clearInterval(pollRef.current), [])
 
+  // Polls one job to completion, then both reservations for the
+  // authoritative settlement outcome -- shared by a fresh submission and by
+  // hydration recovering an in-flight job from a previous mount, so the two
+  // paths can't drift into different polling logic.
+  function pollJob(jobId, resAId, resBId) {
+    clearInterval(pollRef.current)
+    pollRef.current = setInterval(async () => {
+      try {
+        const j = await api.getJob(jobId)
+        setJob(j)
+        const jobDone = !['running', 'queued', 'starting'].includes(j.status)
+        if (!jobDone) return
+        // A job's own status is one node's individual outcome, not the
+        // RESERVATION's -- a mismatch settles both reservations as
+        // 'disputed' even though each job may separately report
+        // 'succeeded'. The authoritative answer is the reservation itself;
+        // settleVerificationGroup runs asynchronously and may not have
+        // finished for both sides the instant this poll tick sees the job
+        // as terminal, so keep polling both reservations until neither is
+        // still 'running'.
+        const [ra, rb] = await Promise.all([api.getReservation(resAId), api.getReservation(resBId)])
+        if (ra.status === 'running' || rb.status === 'running') return
+        clearInterval(pollRef.current)
+        setFinalA(ra.status); setFinalB(rb.status)
+        setA((r) => ({ ...r, status: ra.status }))
+        setB((r) => ({ ...r, status: rb.status }))
+        if (ra.status !== 'disputed') setTimeout(() => onSettled?.(), 500)
+      } catch { /* transient poll failure, try again next tick */ }
+    }, 1000)
+  }
+
   // `pair` is a snapshot from the moment both reservations were booked. If
   // this component unmounts and remounts -- switching to "Share GPU" and
   // back does exactly that, since App only renders one of the two --
@@ -50,15 +81,10 @@ export default function VerifiedPairReservation({ pair, onSettled }) {
   // Caught live: confirming both reservations, then tabbing to Share GPU
   // and back, showed both as unconfirmed again even though the backend had
   // long since captured payment for both. Re-fetch the authoritative
-  // status on every mount instead of trusting the prop.
-  //
-  // KNOWN GAP: if a job was already submitted in an earlier mount, its
-  // job_id is not recoverable here (nothing persists it outside this
-  // component's own state) -- the job-progress view below cannot resume,
-  // it can only report that a reservation moved past 'confirmed' without
-  // being able to show what ran. See the `job === null && !bothConfirmed`
-  // branch's rendering below for how that's surfaced honestly rather than
-  // silently re-showing a submission form that would just fail.
+  // status on every mount instead of trusting the prop -- and, since GET
+  // /reservations/:id now includes the reservation's own job, recover an
+  // in-flight or already-finished job the same way rather than leaving
+  // this mount unable to show what a PREVIOUS mount's submission did.
   useEffect(() => {
     let cancelled = false
     Promise.all([
@@ -68,9 +94,18 @@ export default function VerifiedPairReservation({ pair, onSettled }) {
       if (cancelled) return
       setA((r) => ({ ...r, status: ra.status }))
       setB((r) => ({ ...r, status: rb.status }))
+      const recoveredJob = ra.job ?? rb.job
+      if (!recoveredJob) return
+      setJob(recoveredJob)
+      if (ra.status === 'running' || rb.status === 'running') {
+        pollJob(recoveredJob.job_id, pair.a.reservation_id, pair.b.reservation_id)
+      } else {
+        setFinalA(ra.status); setFinalB(rb.status)
+      }
     }).catch(() => { /* transient -- keep the snapshot, real actions below will surface real errors */ })
       .finally(() => { if (!cancelled) setHydrating(false) })
     return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pair.a.reservation_id, pair.b.reservation_id])
 
   async function confirmOne(which) {
@@ -103,31 +138,7 @@ export default function VerifiedPairReservation({ pair, onSettled }) {
       setA((r) => ({ ...r, status: 'running' }))
       setB((r) => ({ ...r, status: 'running' }))
       setJob({ job_id, status: 'running' })
-      pollRef.current = setInterval(async () => {
-        try {
-          const j = await api.getJob(job_id)
-          setJob(j)
-          const jobDone = !['running', 'queued', 'starting'].includes(j.status)
-          if (!jobDone) return
-          // A job's own status is one node's individual outcome, not the
-          // RESERVATION's -- a mismatch settles both reservations as
-          // 'disputed' even though each job may separately report
-          // 'succeeded'. The authoritative answer is the reservation
-          // itself; settleVerificationGroup runs asynchronously and may
-          // not have finished for both sides the instant this poll tick
-          // sees the job as terminal, so keep polling both reservations
-          // until neither is still 'running'.
-          const [ra, rb] = await Promise.all([
-            api.getReservation(a.reservation_id), api.getReservation(b.reservation_id),
-          ])
-          if (ra.status === 'running' || rb.status === 'running') return
-          clearInterval(pollRef.current)
-          setFinalA(ra.status); setFinalB(rb.status)
-          setA((r) => ({ ...r, status: ra.status }))
-          setB((r) => ({ ...r, status: rb.status }))
-          if (ra.status !== 'disputed') setTimeout(() => onSettled?.(), 500)
-        } catch { /* transient poll failure, try again next tick */ }
-      }, 1000)
+      pollJob(job_id, a.reservation_id, b.reservation_id)
     } catch (e) {
       setSubmitError(e.message)
     } finally {
@@ -137,14 +148,6 @@ export default function VerifiedPairReservation({ pair, onSettled }) {
 
   const bothConfirmed = a.status === 'confirmed' && b.status === 'confirmed'
   const disputed = finalA === 'disputed' && finalB === 'disputed'
-  // True after hydration shows a reservation moved past 'confirmed' (a job
-  // ran, in a PREVIOUS mount of this component) but this mount has no
-  // `job` object to show progress for -- the job_id was never persisted
-  // anywhere outside this component's own state. Rather than silently
-  // re-showing the submission form (which would just fail: the backend
-  // already has a job on this reservation) or the generic "confirm both"
-  // message (misleading -- they're well past that), say so plainly.
-  const jobUnrecoverable = !hydrating && !job && !['held', 'confirmed'].includes(a.status)
 
   return (
     <div className="rounded-lg border border-neutral-200 bg-white p-5 shadow-sm">
@@ -159,19 +162,10 @@ export default function VerifiedPairReservation({ pair, onSettled }) {
         <p className="text-sm text-neutral-500">Checking the current status of both reservations…</p>
       )}
 
-      {!hydrating && !bothConfirmed && !job && !jobUnrecoverable && (
+      {!hydrating && !bothConfirmed && !job && (
         <p className="text-sm text-neutral-500">
           Confirm &amp; pay for both reservations above, then submit one job to run on both.
         </p>
-      )}
-
-      {jobUnrecoverable && (
-        <div className="rounded border border-neutral-200 bg-neutral-50 p-3 text-sm text-neutral-600">
-          A job already ran against these reservations (status: {STEP_LABEL[a.status] ?? a.status} /{' '}
-          {STEP_LABEL[b.status] ?? b.status}) — this view can't resume showing its progress or, if it was
-          disputed, offer a tiebreaker, since the job wasn't tracked outside this page. Search again to
-          book a new job.
-        </div>
       )}
 
       {bothConfirmed && !job && (

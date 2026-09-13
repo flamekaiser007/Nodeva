@@ -84,6 +84,16 @@ class HonestWorker {
     if (msg.type === TYPE.RESERVE_COMMIT) {
       await tick();
       this.sock.receive({ type: TYPE.COMMITTED, reservation_id: msg.reservation_id });
+      return;
+    }
+    if (msg.type === TYPE.JOB_SUBMIT) {
+      await tick();
+      this.sock.receive({ type: TYPE.JOB_ACCEPTED, job_id: msg.job_id });
+      await new Promise((resolve) => setTimeout(resolve, 50)); // see verification-flow.test.js's identical comment
+      this.sock.receive({
+        type: TYPE.JOB_RESULT, job_id: msg.job_id, duration_seconds: 1,
+        status: 'succeeded', exit_code: 0, stdout: 'ok\n', stderr: '',
+      });
     }
   }
 }
@@ -167,6 +177,34 @@ test('an unknown reservation id 404s', { skip }, async () => {
   const buyer = await signup('reservation-read-buyer');
   const res = await fetch(`${base}/reservations/${crypto.randomUUID()}`, { headers: authed(buyer.token) });
   assert.equal(res.status, 404);
+});
+
+test('a reservation with no job yet reports job: null', { skip }, async () => {
+  const buyer = await signup('reservation-read-buyer');
+  const reservationId = await enrollNodeAndReserve(buyer.token, 4);
+  const held = await json(await fetch(`${base}/reservations/${reservationId}`, { headers: authed(buyer.token) }));
+  assert.equal(held.job, null);
+});
+
+test('a reservation with a job includes it -- the job_id a client would otherwise lose on remount', { skip }, async () => {
+  const buyer = await signup('reservation-read-buyer');
+  const reservationId = await enrollNodeAndReserve(buyer.token, 5);
+  await fetch(`${base}/reservations/${reservationId}/confirm`, { method: 'POST', headers: authed(buyer.token) });
+  const submitRes = await json(await fetch(`${base}/reservations/${reservationId}/jobs`, {
+    method: 'POST', headers: { ...authed(buyer.token), 'content-type': 'application/json' },
+    body: JSON.stringify({ image: 'alpine:3.20', command: ['echo', 'ok'] }),
+  }));
+
+  const deadline = Date.now() + 3000;
+  let withJob;
+  while (Date.now() < deadline) {
+    withJob = await json(await fetch(`${base}/reservations/${reservationId}`, { headers: authed(buyer.token) }));
+    if (withJob.job) break;
+    await tick();
+  }
+  assert.ok(withJob.job, 'expected the job to appear on the reservation');
+  assert.equal(withJob.job.job_id, submitRes.job_id);
+  assert.equal(withJob.job.reservation_id, reservationId);
 });
 
 test('an unauthenticated request is rejected', { skip }, async () => {
