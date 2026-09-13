@@ -68,6 +68,49 @@ const NEW_PROVIDER_JOB_THRESHOLD = 5;     // fewer completed jobs than this = un
 const LOW_RELIABILITY_THRESHOLD = 0.9;    // below this = "suspicious" per the master brief
 const HIGH_VALUE_PAISE_THRESHOLD = 10_000; // >= ₹100 quoted = worth the extra scrutiny
 
+// --- third-node fault attribution -----------------------------------------
+//
+// A 2-node mismatch (above) proves at least one node is wrong but never
+// which -- that is a hard limit of two disagreeing samples, not a gap this
+// project left unsolved by accident. The master brief's own answer for
+// going further is a third node: ask an independently-booked node to run
+// the identical workload and majority-vote the three results. This is
+// reputation-only -- the money side of a dispute was already settled
+// honestly (refund_full, both reservations) at dispute time by
+// settleVerificationGroup, and is never revisited here. Re-litigating a
+// refund because a THIRD sample showed up later would be a worse policy
+// than the one already shipped: users need to know a dispute's refund is
+// final, not provisional on whether someone later pays for a tiebreaker.
+
+/** Given the two original (disputed) jobs and a third, independently-run
+ * tiebreaker job in the same verification group, decides whether fault can
+ * be attributed. 'attributed' when the tiebreaker agrees with exactly one
+ * of the two -- that one is vindicated, the other is at fault. A three-way
+ * disagreement (the tiebreaker matches neither) is 'inconclusive': it adds
+ * a second data point against each original node individually, but that is
+ * a weaker claim than "we know which one lied", so nothing is attributed.
+ * Both original jobs matching the tiebreaker should not reach this
+ * function at all (this path only runs on groups already established as a
+ * mismatch) -- handled defensively as 'inconclusive' rather than assumed
+ * away, since asserting an invariant here would crash a settlement path
+ * over what is, at worst, a labeling surprise, not a money bug. */
+export function attributeFaultFromTiebreaker([jobA, jobB], tiebreakerJob) {
+  const aMatches = compareJobResults(jobA, tiebreakerJob) === 'match';
+  const bMatches = compareJobResults(jobB, tiebreakerJob) === 'match';
+  if (aMatches === bMatches) {
+    // Either both matched (the original "mismatch" premise didn't hold, or
+    // the tiebreaker itself failed to produce a usable hash) or neither did
+    // (genuine three-way disagreement) -- in both cases there is no single
+    // node the tiebreaker sides with.
+    return { verdict: 'inconclusive' };
+  }
+  return {
+    verdict: 'attributed',
+    vindicated: aMatches ? jobA : jobB,
+    atFault: aMatches ? jobB : jobA,
+  };
+}
+
 /** Whether a search result is worth flagging to the user as a candidate for
  * duplicate-execution verification -- new/unproven provider, below-threshold
  * reliability, or a high-value booking, matching the master brief's own

@@ -18,8 +18,13 @@
 // at least one of them is wrong, but not which -- there is no principled
 // way to move a specific node's counters from a two-sample disagreement
 // alone. Punishing both would be unfair to whichever one was honest;
-// punishing neither is the only defensible default until a real
-// dispute-resolution process (a third node, say) can attribute fault.
+// punishing neither is the only defensible default from a settlement
+// outcome alone. A real dispute-resolution process now exists as a
+// SEPARATE, opt-in path -- see api/server.js's resolveDisputeTiebreaker,
+// which applies a reputation failure directly to whichever node a
+// third-node majority vote attributes fault to, bypassing this map
+// entirely (it isn't a settlement outcome, so it was never going to fit
+// the EFFECT table below).
 const EFFECT = {
   completed: 'success',
   failed_user: 'success',       // the node did its job; the workload was bad

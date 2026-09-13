@@ -71,11 +71,31 @@ both normally; a mismatch disputes both (full refund, see `machine.js`'s
 
 State the limits precisely, because they are easy to overstate:
 
-- **This detects disagreement. It does not attribute fault.** Two nodes
-  disagreeing proves at least one is wrong, never which — `reputation.js`
-  deliberately leaves both untouched on a dispute rather than guessing.
-  Real fault attribution needs a third node (majority vote) or a much
-  harder verifiable-computation approach; neither exists here.
+- **A 2-node mismatch detects disagreement, it does not attribute fault.**
+  Two nodes disagreeing proves at least one is wrong, never which —
+  `reputation.js` deliberately leaves both untouched on a dispute rather
+  than guessing.
+- **A third node CAN attribute fault — opt-in, reputation-only, and never
+  automatic.** `POST /verification-groups/:groupId/tiebreak`
+  (`jobs/verification.js`'s `attributeFaultFromTiebreaker`,
+  `api/server.js`'s `resolveDisputeTiebreaker`) lets a user who already
+  disputed a job book a third, independent reservation, run the identical
+  workload again, and majority-vote the result. If the tiebreaker agrees
+  with exactly one of the two original nodes, that node is vindicated (no
+  reputation effect — it was never accused of anything) and the other
+  takes a real `rep_jobs_failed` hit. **This never re-litigates the
+  money:** the dispute's full refund to both sides already happened and
+  stays final — a tiebreaker only ever changes who the scheduler should
+  trust going forward, recorded in the `dispute_resolutions` table (one
+  resolution per group, enforced by `UNIQUE(verification_group_id)`, not
+  just application logic). A three-way disagreement (the tiebreaker
+  matches neither original) is `inconclusive` — still no fault attributed,
+  since a third disagreeing sample is not meaningfully stronger evidence
+  than the original tie. This is still not the "much harder
+  verifiable-computation approach" (proving correctness without trusting
+  ANY node) the master brief's Phase 4/5 gestures at — majority vote among
+  three possibly-collaborating parties is a real, bounded improvement, not
+  that.
 - **A match is agreement, not proof of correctness.** Two colluding
   malicious nodes pass cleanly. This raises the cost of cheating
   (compromise or collude with two independent operators, not one) — it does

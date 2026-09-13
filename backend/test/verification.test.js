@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   computeResultHash, compareJobResults, groupIsComplete, shouldRecommendVerification,
+  attributeFaultFromTiebreaker,
 } from '../src/jobs/verification.js';
 
 test('two identical results hash identically', () => {
@@ -141,6 +142,48 @@ test('new_provider and low_reliability are mutually exclusive by construction', 
   }
   const established = shouldRecommendVerification({ repJobsTotal: 5, reliability: 0.1 }, 100);
   assert.ok(established.reasons.includes('low_reliability'), 'repJobsTotal=5 has crossed into "established"');
+});
+
+// --- attributeFaultFromTiebreaker -------------------------------------------
+
+test('a tiebreaker matching job A vindicates A and attributes fault to B', () => {
+  const jobA = { result_hash: 'real-output-hash' };
+  const jobB = { result_hash: 'fabricated-output-hash' };
+  const tiebreaker = { result_hash: 'real-output-hash' };
+  const { verdict, vindicated, atFault } = attributeFaultFromTiebreaker([jobA, jobB], tiebreaker);
+  assert.equal(verdict, 'attributed');
+  assert.equal(vindicated, jobA);
+  assert.equal(atFault, jobB);
+});
+
+test('a tiebreaker matching job B vindicates B and attributes fault to A', () => {
+  const jobA = { result_hash: 'fabricated-output-hash' };
+  const jobB = { result_hash: 'real-output-hash' };
+  const tiebreaker = { result_hash: 'real-output-hash' };
+  const { verdict, vindicated, atFault } = attributeFaultFromTiebreaker([jobA, jobB], tiebreaker);
+  assert.equal(verdict, 'attributed');
+  assert.equal(vindicated, jobB);
+  assert.equal(atFault, jobA);
+});
+
+test('a three-way disagreement is inconclusive -- the tiebreaker sides with neither', () => {
+  const jobA = { result_hash: 'hash-a' };
+  const jobB = { result_hash: 'hash-b' };
+  const tiebreaker = { result_hash: 'hash-c' };
+  const { verdict, vindicated, atFault } = attributeFaultFromTiebreaker([jobA, jobB], tiebreaker);
+  assert.equal(verdict, 'inconclusive');
+  assert.equal(vindicated, undefined);
+  assert.equal(atFault, undefined);
+});
+
+test('a tiebreaker that fails to produce a hash never attributes fault by accident', () => {
+  // A missing hash is always a mismatch per compareJobResults -- so a
+  // crashed tiebreaker node disagrees with BOTH originals, which is the
+  // same shape as a genuine three-way split, not evidence for either side.
+  const jobA = { result_hash: 'hash-a' };
+  const jobB = { result_hash: 'hash-b' };
+  const tiebreaker = { result_hash: null };
+  assert.equal(attributeFaultFromTiebreaker([jobA, jobB], tiebreaker).verdict, 'inconclusive');
 });
 
 test('missing reliability/repJobsTotal fields do not crash and default sensibly', () => {

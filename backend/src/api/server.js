@@ -26,7 +26,9 @@ import {
   createGatewayFromEnv, verifyPaymentSignature, verifyWebhookSignature,
 } from '../payments/razorpay.js';
 import { issueRefund } from '../payments/refunds.js';
-import { computeResultHash, compareJobResults, groupIsComplete } from '../jobs/verification.js';
+import {
+  computeResultHash, compareJobResults, groupIsComplete, attributeFaultFromTiebreaker,
+} from '../jobs/verification.js';
 
 // Job-level (not reservation-level) terminal statuses -- see the schema's
 // CHECK constraint on jobs.status. Used only to decide when a verification
@@ -149,7 +151,20 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
           return;
         }
 
-        await settleVerificationGroup(pool, razorpay, jobRow.verification_group_id);
+        // A group of 2 is the normal duplicate-execution case; it grows to
+        // 3 only when a dispute tiebreaker was submitted against an already-
+        // disputed group (POST /verification-groups/:id/tiebreak) -- that
+        // needs fault-attribution logic instead of settleVerificationGroup's
+        // match/mismatch settlement, since the two original reservations
+        // are already terminal (DISPUTED) and must not be settled again.
+        const { rows: groupCountRows } = await pool.query(
+          'SELECT count(*)::int AS n FROM jobs WHERE verification_group_id = $1',
+          [jobRow.verification_group_id]);
+        if (groupCountRows[0].n >= 3) {
+          await resolveDisputeTiebreaker(pool, razorpay, jobRow.verification_group_id);
+        } else {
+          await settleVerificationGroup(pool, razorpay, jobRow.verification_group_id);
+        }
       } catch (e) {
         // Money must not silently fail to settle. This is exactly the class
         // of drift docs/reservation-protocol.md's reconciler exists for; for
@@ -862,6 +877,101 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
     } catch (e) { next(e); }
   });
 
+  // Third-node fault attribution for a duplicate-execution group that came
+  // back MISMATCHED (docs/security-model.md's Direction 2). This does NOT
+  // touch money -- the dispute already refunded both original reservations
+  // in full via settleVerificationGroup; this is purely about which node's
+  // reputation should carry the disagreement, decided by a majority vote
+  // against an independently-booked third node running the identical
+  // workload. Like verify_against_reservation_id, this is opt-in: nothing
+  // automatically books a tiebreaker on a dispute, since that would spend
+  // the user's money a second time without their say-so.
+  app.post('/verification-groups/:groupId/tiebreak', auth, async (req, res, next) => {
+    try {
+      // All rows in the group, whatever its current size -- a group already
+      // carrying a resolved tiebreaker has grown to 3, and that must still
+      // be detected as "already resolved" rather than falling through to
+      // "not found" just because it no longer looks like a plain pair.
+      const { rows: allGroupJobs } = await pool.query(
+        `SELECT j.job_id, j.reservation_id, j.image, j.command,
+                r.user_id, r.node_id, r.status AS reservation_status
+           FROM jobs j JOIN reservations r ON r.reservation_id = j.reservation_id
+          WHERE j.verification_group_id = $1`,
+        [req.params.groupId]);
+      if (allGroupJobs.length === 0 || allGroupJobs.some((j) => j.user_id !== req.userId)) {
+        return res.status(404).json({ error: 'verification_group_not_found' });
+      }
+      const existingResolution = await pool.query(
+        'SELECT 1 FROM dispute_resolutions WHERE verification_group_id = $1', [req.params.groupId]);
+      if (existingResolution.rows[0]) {
+        return res.status(409).json({ error: 'already_resolved' });
+      }
+      const groupJobs = allGroupJobs.filter((j) => j.reservation_status === S.DISPUTED);
+      if (groupJobs.length !== 2) {
+        return res.status(409).json({ error: 'verification_group_not_disputed' });
+      }
+
+      const { reservation_id: tiebreakerReservationId } = req.body;
+      const { rows: tbRows } = await pool.query(
+        'SELECT * FROM reservations WHERE reservation_id = $1', [tiebreakerReservationId]);
+      const tiebreakerResv = tbRows[0];
+      if (!tiebreakerResv || tiebreakerResv.user_id !== req.userId) {
+        return res.status(404).json({ error: 'tiebreaker_reservation_not_found' });
+      }
+      if (tiebreakerResv.status !== S.CONFIRMED) {
+        return res.status(409).json({ error: `tiebreaker reservation is ${tiebreakerResv.status}, not confirmed` });
+      }
+      if (groupJobs.some((j) => j.node_id === tiebreakerResv.node_id)) {
+        // A tiebreaker run on either of the two disputing nodes proves
+        // nothing -- it would just be that node agreeing with itself again.
+        return res.status(400).json({ error: 'tiebreaker requires a third, different node' });
+      }
+      const alreadyHasJob = await pool.query(
+        'SELECT 1 FROM jobs WHERE reservation_id = $1', [tiebreakerReservationId]);
+      if (alreadyHasJob.rows[0]) {
+        return res.status(409).json({ error: 'tiebreaker reservation already has a job' });
+      }
+
+      // Reuse the ORIGINAL workload's image/command rather than trusting the
+      // client to resupply an "identical" one -- the whole point of a
+      // tiebreaker is that it ran the same thing the disputing nodes did.
+      const { image, command } = groupJobs[0];
+      const jobId = crypto.randomUUID();
+      try {
+        await hub.submitJob(tiebreakerResv.node_id, {
+          jobId, reservationId: tiebreakerResv.reservation_id, image, command,
+        });
+      } catch (e) {
+        if (e instanceof NodeOffline) return res.status(409).json({ error: 'node_offline' });
+        if (e instanceof NodeRefused) return res.status(409).json({ error: e.reason });
+        if (e instanceof NodeTimeout) return res.status(504).json({ error: 'node_unresponsive' });
+        throw e;
+      }
+
+      await pool.query(
+        `INSERT INTO jobs (job_id, reservation_id, image, command, status, started_at, verification_group_id)
+         VALUES ($1,$2,$3,$4,'running',now(),$5)`,
+        [jobId, tiebreakerResv.reservation_id, image, command, req.params.groupId]);
+      await pool.query(
+        "UPDATE reservations SET status='running', updated_at=now() WHERE reservation_id=$1",
+        [tiebreakerResv.reservation_id]);
+
+      res.status(202).json({ job_id: jobId, status: 'running' });
+    } catch (e) { next(e); }
+  });
+
+  app.get('/verification-groups/:groupId/resolution', auth, async (req, res, next) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT dr.* FROM dispute_resolutions dr
+           JOIN reservations r ON r.reservation_id = dr.tiebreaker_reservation_id
+          WHERE dr.verification_group_id = $1 AND r.user_id = $2`,
+        [req.params.groupId, req.userId]);
+      if (!rows[0]) return res.status(404).json({ error: 'not_found' });
+      res.json(rows[0]);
+    } catch (e) { next(e); }
+  });
+
   app.get('/jobs/:id', auth, async (req, res, next) => {
     try {
       // A job's stdout/stderr can contain whatever the user's own code
@@ -949,6 +1059,25 @@ function jobRowStatusToOutcome(jobStatus) {
   }[jobStatus] ?? 'failed_provider';
 }
 
+// Shared by settleReservation and resolveDisputeTiebreaker below -- one
+// place that moves rep_jobs_total/rep_jobs_failed, so a settlement path and
+// a fault-attribution path cannot drift into two different ideas of what
+// counts as a "failure" for reputation purposes.
+async function bumpReputation(client, providerId, effect) {
+  if (!effect) return;
+  await client.query(
+    `UPDATE providers SET rep_jobs_total = rep_jobs_total + 1,
+            rep_jobs_failed = rep_jobs_failed + $2
+      WHERE provider_id = $1`,
+    [providerId, effect === 'failure' ? 1 : 0]);
+}
+
+async function providerIdForNode(client, nodeId) {
+  const { rows } = await client.query(
+    'SELECT provider_id FROM compute_nodes WHERE node_id = $1', [nodeId]);
+  return rows[0]?.provider_id ?? null;
+}
+
 // The settlement side of duplicate-execution verification
 // (jobs/verification.js): once every job sharing a verification_group_id
 // has reached a terminal status, compares their results and settles BOTH
@@ -956,6 +1085,12 @@ function jobRowStatusToOutcome(jobStatus) {
 // different from an unverified job), a mismatch disputes both in full,
 // since two nodes disagreeing proves at least one is wrong but not which
 // (see machine.js's DISPUTED state and reputation.js's handling of it).
+//
+// Only ever called for a 2-job group. A group grows to 3 when a dispute
+// tiebreaker is later submitted (see resolveDisputeTiebreaker) -- that path
+// is deliberately kept separate rather than generalizing this function,
+// since the two answer different questions (settle the money vs. attribute
+// fault after money is already settled).
 async function settleVerificationGroup(pool, paymentGateway, groupId) {
   const { rows: jobs } = await pool.query(
     'SELECT job_id, reservation_id, status, result_hash, compute_seconds FROM jobs WHERE verification_group_id = $1',
@@ -979,6 +1114,89 @@ async function settleVerificationGroup(pool, paymentGateway, groupId) {
     if (result.error) {
       console.error(`verification-group settlement failed for reservation ${job.reservation_id}: ${result.error}`);
     }
+  }
+}
+
+// Runs once a dispute tiebreaker job (see POST /verification-groups/:id/tiebreak
+// below) reaches a terminal status -- the group is now 3 jobs, two of them
+// already DISPUTED (settled, refunded in full by settleVerificationGroup
+// above) and a third that just finished. This function does two genuinely
+// separate things:
+//   1. Settles the TIEBREAKER's own reservation normally, on its own
+//      outcome -- whoever booked it is paying for a fresh, ordinary job,
+//      not re-litigating the original dispute's money.
+//   2. Majority-votes fault: if the tiebreaker agrees with exactly one of
+//      the two original (disputed) nodes, that node is vindicated (no
+//      reputation effect -- it was never charged with anything) and the
+//      other is marked at-fault (a reputation failure, applied directly
+//      since settleReservation cannot re-settle an already-terminal
+//      DISPUTED reservation). A three-way split attributes nothing.
+// Idempotent via dispute_resolutions' UNIQUE(verification_group_id): a
+// duplicate JOB_RESULT delivery (see hub.js's at-least-once semantics)
+// must not double-bump reputation or insert a second resolution row.
+async function resolveDisputeTiebreaker(pool, paymentGateway, groupId) {
+  const { rows: jobs } = await pool.query(
+    `SELECT j.job_id, j.reservation_id, j.status, j.result_hash, j.compute_seconds,
+            r.status AS reservation_status, r.node_id
+       FROM jobs j JOIN reservations r ON r.reservation_id = j.reservation_id
+      WHERE j.verification_group_id = $1`,
+    [groupId]);
+  if (!groupIsComplete(jobs, TERMINAL_JOB_STATUSES)) return; // tiebreaker hasn't finished yet
+
+  const original = jobs.filter((j) => j.reservation_status === S.DISPUTED);
+  const tiebreaker = jobs.find((j) => j.reservation_status !== S.DISPUTED);
+  if (original.length !== 2 || !tiebreaker) {
+    console.error(
+      `verification group ${groupId} has 3 jobs but not the expected shape ` +
+      `(2 disputed + 1 fresh) -- skipping fault attribution`, jobs.map((j) => j.reservation_status));
+    return;
+  }
+
+  const result = await settleReservation(
+    pool, tiebreaker.reservation_id, jobRowStatusToOutcome(tiebreaker.status),
+    tiebreaker.compute_seconds ?? 0, paymentGateway);
+  if (result.error) {
+    console.error(`tiebreaker settlement failed for reservation ${tiebreaker.reservation_id}: ${result.error}`);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // FOR UPDATE-free: the UNIQUE constraint below is the actual guard
+    // against a concurrent duplicate; this SELECT is just an early,
+    // cheaper exit for the common case (one JOB_RESULT, not a race).
+    const existing = await client.query(
+      'SELECT 1 FROM dispute_resolutions WHERE verification_group_id = $1', [groupId]);
+    if (existing.rows[0]) { await client.query('ROLLBACK'); return; }
+
+    const verdict = attributeFaultFromTiebreaker(original, tiebreaker);
+    if (verdict.verdict === 'attributed') {
+      const atFaultProviderId = await providerIdForNode(client, verdict.atFault.node_id);
+      await bumpReputation(client, atFaultProviderId, 'failure');
+      console.warn(
+        `verification group ${groupId}: tiebreaker attributes fault to reservation ` +
+        `${verdict.atFault.reservation_id} (node ${verdict.atFault.node_id}); ` +
+        `${verdict.vindicated.reservation_id} vindicated. No money moves -- both were already refunded in full.`);
+    } else {
+      console.warn(
+        `verification group ${groupId}: tiebreaker result agrees with neither original node -- ` +
+        `still inconclusive, no fault attributed.`);
+    }
+
+    await client.query(
+      `INSERT INTO dispute_resolutions
+         (verification_group_id, tiebreaker_reservation_id, tiebreaker_job_id, verdict,
+          vindicated_reservation_id, at_fault_reservation_id)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [groupId, tiebreaker.reservation_id, tiebreaker.job_id, verdict.verdict,
+        verdict.vindicated?.reservation_id ?? null, verdict.atFault?.reservation_id ?? null]);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (e.code === '23505') return; // lost the race to a concurrent resolution -- fine, already recorded
+    throw e;
+  } finally {
+    client.release();
   }
 }
 
@@ -1100,14 +1318,7 @@ export async function settleReservation(pool, reservationId, outcome, computeSec
     // outcomes where a job actually ran on the node move these counters,
     // and the user's own workload failing does not count against the
     // provider that faithfully ran it.
-    const effect = reputationEffect(outcome);
-    if (effect) {
-      await client.query(
-        `UPDATE providers SET rep_jobs_total = rep_jobs_total + 1,
-                rep_jobs_failed = rep_jobs_failed + $2
-          WHERE provider_id = $1`,
-        [providerId, effect === 'failure' ? 1 : 0]);
-    }
+    await bumpReputation(client, providerId, reputationEffect(outcome));
 
     await client.query('COMMIT');
 

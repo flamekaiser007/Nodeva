@@ -246,10 +246,33 @@ Phase 1, early. What exists and is tested:
   ever evaluated for a provider with an actual track record, and a
   regression test now pins the realistic (0.8-default) case the first
   fixture missed.
+- `POST /verification-groups/:groupId/tiebreak` (`jobs/verification.js`'s
+  `attributeFaultFromTiebreaker`, `api/server.js`'s
+  `resolveDisputeTiebreaker`) — the third-node dispute-resolution mechanism
+  the previous commit named as the remaining gap in Direction 2. Once a
+  duplicate-execution group comes back `disputed` (two nodes disagreed,
+  both already refunded in full), a user can book a third, independent
+  reservation and re-run the identical workload; if the tiebreaker agrees
+  with exactly one of the two original nodes, that node is vindicated (no
+  reputation effect) and the other takes a real `rep_jobs_failed` hit. A
+  three-way disagreement is `inconclusive` and attributes nothing. This is
+  strictly reputation, never money: the original dispute's refund is
+  final and is never revisited, by design -- re-litigating a settled
+  refund because a third sample showed up later would make refunds feel
+  provisional, which is a worse property than the one already shipped.
+  One resolution per group is enforced by a real Postgres `UNIQUE`
+  constraint (`dispute_resolutions.verification_group_id`), not just
+  application logic, so a duplicate `JOB_RESULT` delivery (`hub.js`'s
+  at-least-once semantics) can't double-attribute fault. Verified against
+  a real Hub, real Postgres, and three scripted worker sockets exercising
+  all three verdicts (vindicated/at-fault, inconclusive, and the endpoint's
+  own validation: refusing a tiebreak against a still-matched group,
+  against a reservation on one of the two disputing nodes, and a second
+  tiebreak attempt against an already-resolved group).
 
-Not built yet: P2P discovery beyond one platform-worker link, and a real
-dispute-resolution process that can attribute fault beyond "at least one
-of these two nodes is wrong" (a third-node majority vote, say).
+Not built yet: P2P discovery beyond one platform-worker link. This is
+Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
+libp2p, and shouldn't have it") and is deliberately not started early.
 
 ## Running
 
