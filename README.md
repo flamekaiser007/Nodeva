@@ -124,15 +124,35 @@ Phase 1, early. What exists and is tested:
   UI, connected a real worker, and watched it flip from a grey OFFLINE dot
   to a green ONLINE one via the dashboard's own polling, no manual refresh.
 
-Not built yet: a real payment gateway (`confirm` moves numbers between
-internal ledger accounts; nothing has ever touched an actual processor --
-this is the biggest remaining gap between "demo" and "chargeable MVP"),
-account recovery (forgot-password, email verification), P2P discovery
-beyond one platform-worker link, protecting users from malicious providers
-(no result verification / duplicate execution yet), and a reservation-status
-query a platform could use to resolve the one documented node/platform state
-mismatch that can still leave a user stuck (safe -- no money or
-double-booking risk, just a stuck UX).
+- `backend/src/payments/razorpay.js` + the two-phase
+  `/reservations/:id/confirm` → `/confirm/verify` flow + `POST /webhooks/razorpay`
+  — real Razorpay integration: order creation, HMAC signature verification
+  (both the client callback's and the webhook's), and gateway refunds. Falls
+  back to the exact previous ledger-only behavior, loudly logged, when no
+  credentials are configured (`RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` unset)
+  -- which is the state every test and the e2e script run in, since **this
+  project has no live Razorpay account** (creating one needs a real business
+  identity; it isn't something that can be done on someone else's behalf).
+  Signature math and outgoing-request shape are genuinely tested with no
+  external dependency; the full order→verify→capture→compensating-refund
+  orchestration is tested end to end against a fake gateway speaking the
+  identical protocol. What's explicitly unverified: that Razorpay's real API
+  responds the way its docs say it will. See
+  [docs/payment-architecture.md](docs/payment-architecture.md) for the full
+  picture, including the one gap surfaced while building this — an
+  unreachable node discovered *after* a live gateway has already captured
+  real money now needs an actual refund, not just an internal status flip,
+  and the webhook path was initially missing that compensation (a fix
+  informed by, not just followed by, the test that first proved the direct
+  verify endpoint needed it).
+
+Not built yet: account recovery (forgot-password, email verification), P2P
+discovery beyond one platform-worker link, protecting users from malicious
+providers (no result verification / duplicate execution yet), a
+reservation-status query a platform could use to resolve the one documented
+node/platform state mismatch that can still leave a user stuck (safe -- no
+money or double-booking risk, just a stuck UX), and a durable retry queue
+for the rare case where a compensating refund call to the gateway itself fails.
 
 ## Running
 
@@ -143,11 +163,13 @@ for f in backend/migrations/*.sql; do
   docker compose exec -T postgres psql -U nodeva -d nodeva < "$f"
 done
 
-# backend tests (76) -- JWT_SECRET only needed by tests that build the full
+# backend tests (101) -- JWT_SECRET only needed by tests that build the full
 # app (server.js); the unit test files don't call createApp() so most pass
-# without it, but set it anyway to be safe. reconciler.test.js and
-# reputation-integration.test.js additionally need a reachable Postgres
-# (docker compose up -d postgres) and skip cleanly if there isn't one.
+# without it, but set it anyway to be safe. Several suites (reconciler,
+# reputation-integration, dashboard, payment-flow) additionally need a
+# reachable Postgres (docker compose up -d postgres) and skip cleanly if
+# there isn't one. RAZORPAY_KEY_ID/SECRET are deliberately left UNSET here --
+# see docs/payment-architecture.md for why, and what runs instead.
 export JWT_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
 cd backend && node --test test/*.test.js
 

@@ -21,6 +21,9 @@ import { reputationEffect } from '../providers/reputation.js';
 import { hashPassword, verifyPassword } from '../auth/password.js';
 import { requireJwtSecret, signSession } from '../auth/jwt.js';
 import { requireAuth } from '../auth/middleware.js';
+import {
+  createGatewayFromEnv, verifyPaymentSignature, verifyWebhookSignature,
+} from '../payments/razorpay.js';
 
 // A REAL bcrypt hash of a fixed, never-used value -- not a made-up string.
 // login compares against this when the email does not exist, so bcrypt does
@@ -30,15 +33,28 @@ import { requireAuth } from '../auth/middleware.js';
 const DUMMY_HASH_FOR_TIMING_SAFETY =
   '$2b$12$S166KyDHkghng0qE2TtfReFNZp3CAGlX/iFL1s1XgwlQrPyOrKtZi';
 
-export function createApp(pool) {
+export function createApp(pool, { paymentGateway } = {}) {
   const app = express();
   const jwtSecret = requireJwtSecret();
   const auth = requireAuth(jwtSecret);
+  // Injectable for tests; defaults to reading RAZORPAY_KEY_ID/SECRET from the
+  // environment. Falls back to UnconfiguredGateway (loud, honest, ledger-only)
+  // when they are absent -- see payments/razorpay.js's file header for what
+  // that does and does not mean. Named distinctly from the existing local
+  // `gateway` variable used elsewhere for the internal 'gateway_clearing'
+  // LEDGER ACCOUNT -- same word, two different things, kept apart on purpose.
+  const razorpay = paymentGateway ?? createGatewayFromEnv();
   // Dev-permissive CORS: the frontend runs on a different origin (Vite's
   // dev server). Not something to carry into a real deployment unchanged --
   // production should allow-list the actual frontend origin, not '*'.
   app.use(cors());
-  app.use(express.json());
+  // `verify` captures the exact raw bytes alongside the parsed body -- the
+  // Razorpay webhook handler below needs those raw bytes for signature
+  // verification (re-serializing req.body is not guaranteed to reproduce
+  // what Razorpay actually signed; see razorpay.js's own note on this, which
+  // is the same canonical-encoding lesson this project already learned once
+  // for node-to-platform receipts).
+  app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
   // In-memory only, deliberately: heartbeats arrive every 15s and are
   // superseded by the next one almost immediately, so persisting them to
@@ -91,7 +107,7 @@ export function createApp(pool) {
           return;
         }
         const outcome = jobStatusToSettlement(msg.status);
-        const result = await settleReservation(pool, reservationId, outcome, Math.round(msg.duration_seconds ?? 0));
+        const result = await settleReservation(pool, reservationId, outcome, Math.round(msg.duration_seconds ?? 0), razorpay);
         // settleReservation reports problems by RETURNING an {error} object,
         // not by throwing -- the catch block below does not see these. This
         // is exactly the shape of bug that left a reservation stuck at
@@ -426,63 +442,200 @@ export function createApp(pool) {
   // reservation that was not theirs. auth + the owner check below close
   // that; a 404 rather than 403 on mismatch avoids confirming to a prober
   // that the id exists at all.
+  // Two phases when a live gateway is configured (Razorpay's own documented
+  // integration model): this endpoint creates an ORDER and hands it to the
+  // client for Checkout.js -- it does NOT touch the node or escrow yet, on
+  // purpose. Only a verified payment signature (POST .../confirm/verify
+  // below) or the webhook may do that. With no live gateway configured, it
+  // falls back to the previous immediate behavior unchanged, so every
+  // existing test and the e2e script keep working without needing real
+  // Razorpay credentials.
   app.post('/reservations/:id/confirm', auth, async (req, res, next) => {
-    const client = await pool.connect();
     try {
-      const { rows } = await client.query(
-        'SELECT * FROM reservations WHERE reservation_id = $1 FOR UPDATE',
-        [req.params.id]);
+      const { rows } = await pool.query(
+        'SELECT * FROM reservations WHERE reservation_id = $1', [req.params.id]);
       const resv = rows[0];
       if (!resv || resv.user_id !== req.userId) return res.status(404).json({ error: 'not_found' });
       if (!canTransition(resv.status, S.CONFIRMED)) {
         return res.status(409).json({ error: `cannot confirm from ${resv.status}` });
       }
 
-      let committed;
-      try {
-        committed = await hub.commitReservation(resv.node_id, resv.reservation_id);
-      } catch (e) {
-        if (e instanceof NodeOffline || e instanceof NodeTimeout) {
-          // The hold likely lapsed on the node's side too. Do not capture money
-          // for a slot we cannot prove the node still honours.
-          await client.query('BEGIN');
-          await client.query(
-            "UPDATE reservations SET status='expired', updated_at=now() WHERE reservation_id=$1",
-            [resv.reservation_id]);
-          await client.query('COMMIT');
-          return res.status(409).json({ error: 'node_unreachable_hold_not_confirmed' });
+      const order = await razorpay.createOrder(resv.quoted_paise, resv.reservation_id);
+      await pool.query(
+        `INSERT INTO payments (user_id, reservation_id, gateway, gateway_ref, amount_paise, status)
+         VALUES ($1,$2,$3,$4,$5,'created')`,
+        [resv.user_id, resv.reservation_id, razorpay.isConfigured ? 'razorpay' : 'none',
+         order.id, resv.quoted_paise]);
+
+      if (!razorpay.isConfigured) {
+        const client = await pool.connect();
+        try {
+          const result = await commitNodeAndCapture(client, hub, resv);
+          if (result.error) return res.status(result.status).json({ error: result.error });
+          await pool.query(
+            "UPDATE payments SET status='captured' WHERE reservation_id=$1 AND gateway_ref=$2",
+            [resv.reservation_id, order.id]);
+          return res.json(result);
+        } finally {
+          client.release();
         }
-        throw e;
       }
-      void committed;
 
-      await client.query('BEGIN');
-      await ensureAccounts(client, resv.user_id, null);
-      const gateway = await accountId(client, 'gateway_clearing', null, null);
-      const escrow = await accountId(client, 'user_escrow', resv.user_id, null);
-
-      const txn = await client.query(
-        `INSERT INTO ledger_transactions (kind, reservation_id, idempotency_key)
-         VALUES ('capture', $1, $2) RETURNING txn_id`,
-        [resv.reservation_id, `capture-${resv.reservation_id}`]);
-      const txnId = txn.rows[0].txn_id;
-      await client.query(
-        'INSERT INTO ledger_entries (txn_id, account_id, amount_paise) VALUES ($1,$2,$3),($1,$4,$5)',
-        [txnId, gateway, -resv.quoted_paise, escrow, resv.quoted_paise]);
-
-      await client.query(
-        "UPDATE reservations SET status='confirmed', updated_at=now() WHERE reservation_id=$1",
-        [resv.reservation_id]);
-      await client.query('COMMIT');
-
-      res.json({ reservation_id: resv.reservation_id, status: S.CONFIRMED });
+      res.json({
+        requires_payment: true, order_id: order.id,
+        amount_paise: resv.quoted_paise, currency: 'INR', razorpay_key_id: razorpay.keyId,
+      });
     } catch (e) {
-      await client.query('ROLLBACK').catch(() => {});
       if (e.code === '23505') return res.status(409).json({ error: 'already_captured' });
+      next(e);
+    }
+  });
+
+  // Checkout.js hands the client {order_id, payment_id, signature} after a
+  // successful payment. The signature is the ONLY thing that turns "the
+  // browser says it worked" into "Razorpay's servers say it worked" -- see
+  // payments/razorpay.js's verifyPaymentSignature for why the callback firing
+  // is not, on its own, proof of anything.
+  app.post('/reservations/:id/confirm/verify', auth, async (req, res, next) => {
+    if (!razorpay.isConfigured) {
+      return res.status(400).json({ error: 'no_live_gateway_configured' });
+    }
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    const client = await pool.connect();
+    try {
+      const { rows } = await client.query(
+        'SELECT * FROM reservations WHERE reservation_id = $1 FOR UPDATE', [req.params.id]);
+      const resv = rows[0];
+      if (!resv || resv.user_id !== req.userId) return res.status(404).json({ error: 'not_found' });
+      if (!canTransition(resv.status, S.CONFIRMED)) {
+        return res.status(409).json({ error: `cannot confirm from ${resv.status}` });
+      }
+
+      const paymentRow = await client.query(
+        `SELECT * FROM payments WHERE reservation_id=$1 AND gateway_ref=$2 AND status='created'`,
+        [resv.reservation_id, razorpay_order_id]);
+      if (!paymentRow.rows[0]) return res.status(404).json({ error: 'payment_order_not_found' });
+      const payment = paymentRow.rows[0];
+
+      const valid = verifyPaymentSignature({
+        orderId: razorpay_order_id, paymentId: razorpay_payment_id,
+        signature: razorpay_signature, keySecret: razorpay.keySecret,
+      });
+      if (!valid) {
+        await client.query("UPDATE payments SET status='failed' WHERE payment_id=$1", [payment.payment_id]);
+        return res.status(400).json({ error: 'invalid_payment_signature' });
+      }
+
+      // Past this point, real money has moved -- Razorpay's signature proves
+      // Razorpay itself considers the payment captured. This is the fork the
+      // no-gateway path never had to make: if the node turns out unreachable
+      // NOW, we are not "safely never captured" any more, we are holding a
+      // real charge for a slot we cannot deliver, and that needs an actual
+      // refund through the gateway, not just an internal status flip.
+      await client.query(
+        "UPDATE payments SET status='captured', gateway_ref=$2 WHERE payment_id=$1",
+        [payment.payment_id, razorpay_payment_id]);
+
+      const result = await commitNodeAndCapture(client, hub, resv);
+      if (result.error) {
+        try {
+          await razorpay.refund(razorpay_payment_id, resv.quoted_paise);
+          await pool.query("UPDATE payments SET status='refunded' WHERE payment_id=$1", [payment.payment_id]);
+        } catch (refundErr) {
+          // Loud and unambiguous: a failed automatic refund after a
+          // confirmed charge is exactly the kind of drift that must never
+          // fail silently. Manual reconciliation is the fallback until this
+          // has a retry queue.
+          console.error(
+            `CRITICAL: payment ${razorpay_payment_id} was captured but the node was ` +
+            `unreachable and the compensating refund ALSO failed -- manual refund required:`,
+            refundErr);
+        }
+        return res.status(result.status).json({ error: result.error, refunded: true });
+      }
+      res.json(result);
+    } catch (e) {
       next(e);
     } finally {
       client.release();
     }
+  });
+
+  // Razorpay's server-to-server notification -- more authoritative than the
+  // client-side callback above (it comes from Razorpay directly, not
+  // relayed through a browser that could close, crash, or lie). Handles
+  // payment.captured as a backstop for a verify call that never arrived
+  // (e.g. the user closed the tab right after paying) -- idempotent, since a
+  // webhook can be, and often is, delivered more than once by design.
+  app.post('/webhooks/razorpay', async (req, res) => {
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      // Distinct from "gateway not configured": a deployment could plausibly
+      // take payments via Checkout+verify alone and skip webhooks, but a
+      // webhook endpoint that accepts unsigned events is a way to inject
+      // fake payment confirmations. Refuse outright rather than trusting it.
+      return res.status(500).json({ error: 'RAZORPAY_WEBHOOK_SECRET not configured' });
+    }
+    const signature = req.get('x-razorpay-signature');
+    if (!signature || !verifyWebhookSignature({ rawBody: req.rawBody, signature, webhookSecret })) {
+      return res.status(400).json({ error: 'invalid_webhook_signature' });
+    }
+
+    const event = req.body?.event;
+    const paymentEntity = req.body?.payload?.payment?.entity;
+    if (event === 'payment.captured' && paymentEntity) {
+      try {
+        const orderId = paymentEntity.order_id;
+        const paymentRow = await pool.query(
+          `SELECT * FROM payments WHERE gateway_ref = $1 AND status = 'created'`, [orderId]);
+        const payment = paymentRow.rows[0];
+        if (payment) {
+          // Same idempotent path the verify endpoint uses -- if verify
+          // already ran (the common case), this UPDATE affects zero rows
+          // and commitNodeAndCapture is never reached a second time,
+          // because the reservation's own status is no longer transitionable.
+          const client = await pool.connect();
+          try {
+            await client.query(
+              "UPDATE payments SET status='captured', gateway_ref=$2 WHERE payment_id=$1",
+              [payment.payment_id, paymentEntity.id]);
+            const { rows } = await client.query(
+              'SELECT * FROM reservations WHERE reservation_id = $1 FOR UPDATE',
+              [payment.reservation_id]);
+            const resv = rows[0];
+            if (resv && canTransition(resv.status, S.CONFIRMED)) {
+              const result = await commitNodeAndCapture(client, hub, resv);
+              // Mirrors the /confirm/verify endpoint's compensating refund --
+              // this branch was missing it on the first pass, which would
+              // have left a payment captured-but-unrefunded for a slot the
+              // node never delivered whenever the WEBHOOK (rather than the
+              // client callback) was the path that observed the failure.
+              // The two paths must agree, since either can be the one that
+              // actually runs for a given payment.
+              if (result.error) {
+                try {
+                  await razorpay.refund(paymentEntity.id, payment.amount_paise);
+                  await client.query("UPDATE payments SET status='refunded' WHERE payment_id=$1",
+                    [payment.payment_id]);
+                } catch (refundErr) {
+                  console.error(
+                    `CRITICAL: payment ${paymentEntity.id} was captured via webhook but the ` +
+                    `node was unreachable and the compensating refund ALSO failed -- manual refund required:`,
+                    refundErr);
+                }
+              }
+            }
+          } finally {
+            client.release();
+          }
+        }
+      } catch (e) {
+        console.error('failed to process payment.captured webhook:', e);
+      }
+    }
+    // Razorpay only cares that this returns 2xx; the actual side effect
+    // already happened (or didn't, and was logged) above.
+    res.json({ received: true });
   });
 
   // Job completion + settlement, shared by the manual endpoint below and
@@ -506,7 +659,7 @@ export function createApp(pool) {
         [req.params.id, req.userId]);
       if (!owned.rows[0]) return res.status(404).json({ error: 'not_found' });
       const result = await settleReservation(
-        pool, req.params.id, req.body.outcome, req.body.compute_seconds);
+        pool, req.params.id, req.body.outcome, req.body.compute_seconds, razorpay);
       if (result.error) return res.status(result.status).json({ error: result.error });
       res.json(result);
     } catch (e) { next(e); }
@@ -622,11 +775,63 @@ function jobStatusToSettlement(execStatus) {
   }[execStatus] ?? 'failed_provider';
 }
 
+// The node+escrow half of confirming a reservation: commit the node's hold
+// permanently, then move the quoted amount from user_escrow into
+// gateway_clearing. Shared by the no-live-gateway immediate path, the
+// Razorpay signature-verify endpoint, and the webhook handler -- one
+// implementation, so "does confirming actually move the ledger the same
+// way regardless of which path got you there" is true by construction
+// rather than something three copies could quietly drift apart on.
+async function commitNodeAndCapture(client, hub, resv) {
+  try {
+    await hub.commitReservation(resv.node_id, resv.reservation_id);
+  } catch (e) {
+    if (e instanceof NodeOffline || e instanceof NodeTimeout) {
+      // The hold likely lapsed on the node's side too. Do not capture money
+      // for a slot we cannot prove the node still honours.
+      await client.query('BEGIN');
+      await client.query(
+        "UPDATE reservations SET status='expired', updated_at=now() WHERE reservation_id=$1",
+        [resv.reservation_id]);
+      await client.query('COMMIT');
+      return { error: 'node_unreachable_hold_not_confirmed', status: 409 };
+    }
+    throw e;
+  }
+
+  try {
+    await client.query('BEGIN');
+    await ensureAccounts(client, resv.user_id, null);
+    const gatewayAcct = await accountId(client, 'gateway_clearing', null, null);
+    const escrow = await accountId(client, 'user_escrow', resv.user_id, null);
+
+    const txn = await client.query(
+      `INSERT INTO ledger_transactions (kind, reservation_id, idempotency_key)
+       VALUES ('capture', $1, $2) RETURNING txn_id`,
+      [resv.reservation_id, `capture-${resv.reservation_id}`]);
+    const txnId = txn.rows[0].txn_id;
+    await client.query(
+      'INSERT INTO ledger_entries (txn_id, account_id, amount_paise) VALUES ($1,$2,$3),($1,$4,$5)',
+      [txnId, gatewayAcct, -resv.quoted_paise, escrow, resv.quoted_paise]);
+
+    await client.query(
+      "UPDATE reservations SET status='confirmed', updated_at=now() WHERE reservation_id=$1",
+      [resv.reservation_id]);
+    await client.query('COMMIT');
+
+    return { reservation_id: resv.reservation_id, status: S.CONFIRMED };
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (e.code === '23505') return { error: 'already_captured', status: 409 };
+    throw e;
+  }
+}
+
 // Settlement, usable both from the manual /complete route and from
 // onJobResult once a real job finishes. Returns a plain result object rather
 // than writing to `res` directly, so callers that are not HTTP handlers (the
 // hub's job-result callback) can use it identically.
-export async function settleReservation(pool, reservationId, outcome, computeSeconds) {
+export async function settleReservation(pool, reservationId, outcome, computeSeconds, paymentGateway) {
   const client = await pool.connect();
   try {
     const { rows } = await client.query(
@@ -698,6 +903,34 @@ export async function settleReservation(pool, reservationId, outcome, computeSec
     }
 
     await client.query('COMMIT');
+
+    // If real money was collected through a live gateway for this
+    // reservation, a refund owed here must actually reach the user, not
+    // just move numbers between internal ledger accounts -- the `refunds`
+    // account above records that we OWE it; this is what actually pays it.
+    // Best-effort: a failed gateway refund does not roll back the ledger
+    // entries already committed (the internal accounting that we owe a
+    // refund is correct regardless of whether the external call to give it
+    // back succeeded yet), it is logged loudly for manual follow-up instead
+    // -- the same posture as the verify endpoint's compensating-refund path.
+    if (refund > 0 && paymentGateway?.isConfigured) {
+      try {
+        const paid = await pool.query(
+          `SELECT gateway_ref FROM payments WHERE reservation_id = $1 AND status = 'captured'
+             AND gateway = 'razorpay' LIMIT 1`,
+          [resv.reservation_id]);
+        if (paid.rows[0]) {
+          await paymentGateway.refund(paid.rows[0].gateway_ref, refund);
+          await pool.query(
+            `UPDATE payments SET status='refunded' WHERE reservation_id=$1 AND gateway_ref=$2`,
+            [resv.reservation_id, paid.rows[0].gateway_ref]);
+        }
+      } catch (e) {
+        console.error(
+          `CRITICAL: reservation ${resv.reservation_id} owes a ${refund}-paise refund ` +
+          `that the gateway call failed to issue -- manual refund required:`, e);
+      }
+    }
 
     return { reservation_id: resv.reservation_id, status: outcome,
              charged_paise: chargePaise, refunded_paise: refund };

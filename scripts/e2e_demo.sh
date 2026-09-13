@@ -172,6 +172,16 @@ echo "OK"
 echo "== confirm as the buyer: captures into escrow =="
 curl -sf -X POST "http://localhost:3100/reservations/$RID/confirm" -H "$(auth_header "$BUYER_TOKEN")"; echo
 
+echo "== the payments table (defined since the first migration, unused until now) got a row =="
+# No RAZORPAY_KEY_ID is set for this script, so the honest no-gateway
+# fallback in payments/razorpay.js should have recorded gateway='none' and
+# gone straight to 'captured' -- confirms the audit trail exists even when
+# no live payment processor is configured.
+PAYMENT_ROW=$(docker compose exec -T postgres psql -U nodeva -d nodeva -t -A -c \
+  "SELECT gateway || ',' || status FROM payments WHERE reservation_id='$RID';")
+[ "$PAYMENT_ROW" = "none,captured" ] || { echo "FAIL: expected none,captured, got $PAYMENT_ROW"; exit 1; }
+echo "OK: $PAYMENT_ROW"
+
 echo "== submit a real job: runs in an actual sandboxed container on the worker =="
 if command -v docker >/dev/null 2>&1 && docker image inspect alpine:3.20 >/dev/null 2>&1; then
   JOB=$(curl -sf -X POST "http://localhost:3100/reservations/$RID/jobs" -H "$(auth_header "$BUYER_TOKEN")" \

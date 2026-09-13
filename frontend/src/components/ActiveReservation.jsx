@@ -1,6 +1,28 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 
+// A sentinel, not a real error message -- see confirm()'s catch block for why.
+const RAZORPAY_HANDLED = '__razorpay_already_handled__'
+
+// Loads Checkout.js on demand rather than unconditionally in index.html:
+// most page views never reach a payment, and this keeps the no-live-gateway
+// path (the one actually exercised by every automated test in this project)
+// from depending on a third-party script at all.
+let checkoutScriptPromise = null
+function loadRazorpayCheckout() {
+  if (window.Razorpay) return Promise.resolve(window.Razorpay)
+  if (!checkoutScriptPromise) {
+    checkoutScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script')
+      script.src = 'https://checkout.razorpay.com/v1/checkout.js'
+      script.onload = () => resolve(window.Razorpay)
+      script.onerror = () => reject(new Error('failed to load the Razorpay Checkout script'))
+      document.body.appendChild(script)
+    })
+  }
+  return checkoutScriptPromise
+}
+
 const STEP_LABEL = {
   held: 'Held — awaiting payment',
   confirmed: 'Confirmed — ready to run a job',
@@ -30,12 +52,71 @@ export default function ActiveReservation({ reservation, onSettled }) {
     setBusy(true); setError(null)
     try {
       const r = await api.confirmReservation(reservation.reservation_id)
-      setStatus(r.status)
+      if (r.requires_payment) {
+        await payWithRazorpay(r)
+      } else {
+        // No live gateway configured on the backend -- confirmed immediately,
+        // exactly as before this feature existed.
+        setStatus(r.status)
+      }
     } catch (e) {
-      setError(e.message)
+      // payWithRazorpay already calls setError itself for the cases a user
+      // can actually do something about (payment failed, dismissed the
+      // modal) -- rethrowing a sentinel for those rather than a real Error
+      // here would double up the message, so only report what it didn't.
+      if (e.message !== RAZORPAY_HANDLED) setError(e.message)
     } finally {
       setBusy(false)
     }
+  }
+
+  // UNVERIFIED AGAINST A LIVE RAZORPAY ACCOUNT -- this project has no
+  // Razorpay credentials (see backend/src/payments/razorpay.js's file
+  // header for why: creating a merchant account isn't something that can be
+  // done on someone else's behalf). Written correctly against Razorpay's
+  // documented Checkout.js integration; the backend half of this contract
+  // (order creation, signature verification, the compensating refund if the
+  // node turns out unreachable after payment) IS tested for real, against a
+  // fake gateway that speaks the identical wire protocol -- see
+  // backend/test/payment-flow.test.js.
+  async function payWithRazorpay(order) {
+    const Razorpay = await loadRazorpayCheckout()
+    return new Promise((resolve, reject) => {
+      const rzp = new Razorpay({
+        key: order.razorpay_key_id,
+        amount: order.amount_paise,
+        currency: order.currency,
+        order_id: order.order_id,
+        name: 'NODEVA',
+        description: `Reservation ${reservation.reservation_id.slice(0, 8)}`,
+        handler: async (response) => {
+          try {
+            const result = await api.verifyPayment(reservation.reservation_id, {
+              razorpay_order_id: response.razorpay_order_id,
+              razorpay_payment_id: response.razorpay_payment_id,
+              razorpay_signature: response.razorpay_signature,
+            })
+            setStatus(result.status)
+            resolve()
+          } catch (e) {
+            setError(e.message)
+            reject(new Error(RAZORPAY_HANDLED))
+          }
+        },
+        modal: {
+          ondismiss: () => {
+            setError('Payment cancelled.')
+            reject(new Error(RAZORPAY_HANDLED))
+          },
+        },
+        theme: { color: '#047857' },
+      })
+      rzp.on('payment.failed', (resp) => {
+        setError(resp.error?.description ?? 'Payment failed.')
+        reject(new Error(RAZORPAY_HANDLED))
+      })
+      rzp.open()
+    })
   }
 
   async function submitJob(e) {

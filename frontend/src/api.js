@@ -51,8 +51,18 @@ export const api = {
       body: JSON.stringify({ node_id, starts_at, ends_at }),
     }),
 
+  // Returns either {status:'confirmed', ...} directly (no live gateway
+  // configured on the backend) or {requires_payment:true, order_id,
+  // amount_paise, currency, razorpay_key_id} (a live gateway IS configured
+  // -- the caller must run Checkout.js and then call verifyPayment).
   confirmReservation: (reservationId) =>
     request(`/reservations/${reservationId}/confirm`, { method: 'POST' }),
+
+  verifyPayment: (reservationId, { razorpay_order_id, razorpay_payment_id, razorpay_signature }) =>
+    request(`/reservations/${reservationId}/confirm/verify`, {
+      method: 'POST',
+      body: JSON.stringify({ razorpay_order_id, razorpay_payment_id, razorpay_signature }),
+    }),
 
   // --- jobs --------------------------------------------------------
   submitJob: (reservationId, { image, command, timeout_seconds }) =>
