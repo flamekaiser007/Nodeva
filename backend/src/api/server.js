@@ -375,6 +375,44 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
           WHERE a.kind = 'provider_balance' AND a.owner_provider_id = $1`,
         [provider.provider_id]);
 
+      // A provider's rep_jobs_failed can move for a reason that never shows
+      // up anywhere else on this dashboard: a duplicate-execution mismatch
+      // on one of their nodes, resolved (or still pending resolution) via a
+      // third-node tiebreaker (jobs/verification.js, resolveDisputeTiebreaker
+      // in this file). Without this, a provider sees their reliability
+      // number move and has no way to find out why. LEFT JOIN so a dispute
+      // that hasn't been tiebroken yet still shows up, with resolution null.
+      //
+      // Joined via jobs.verification_group_id, NOT via
+      // vindicated/at_fault_reservation_id -- caught live: an 'inconclusive'
+      // verdict leaves BOTH of those columns NULL (nothing was attributed),
+      // so a join keyed on them can never match an inconclusive resolution,
+      // and a genuinely resolved dispute would sit forever labeled "awaiting
+      // tiebreaker". The group id is the one thing every resolution always
+      // has, resolved or not.
+      const disputesResult = await pool.query(
+        `SELECT r.reservation_id, r.node_id, r.updated_at AS disputed_at,
+                dr.verdict, dr.vindicated_reservation_id, dr.at_fault_reservation_id
+           FROM reservations r
+           JOIN compute_nodes cn ON cn.node_id = r.node_id
+           JOIN jobs j ON j.reservation_id = r.reservation_id
+           LEFT JOIN dispute_resolutions dr ON dr.verification_group_id = j.verification_group_id
+          WHERE cn.provider_id = $1 AND r.status = 'disputed'
+          ORDER BY r.updated_at DESC
+          LIMIT 20`,
+        [provider.provider_id]);
+      const disputes = disputesResult.rows.map((d) => ({
+        reservation_id: d.reservation_id,
+        node_id: d.node_id,
+        disputed_at: d.disputed_at,
+        resolution: d.verdict ? {
+          verdict: d.verdict,
+          outcome: d.at_fault_reservation_id === d.reservation_id ? 'at_fault'
+            : d.vindicated_reservation_id === d.reservation_id ? 'vindicated'
+              : null, // inconclusive: this reservation is named on neither side
+        } : null, // no tiebreaker requested (yet) for this dispute
+      }));
+
       res.json({
         provider_id: provider.provider_id,
         reputation: {
@@ -386,6 +424,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
         },
         earnings: earningsRow.rows[0],
         nodes,
+        disputes,
       });
     } catch (e) { next(e); }
   });

@@ -324,6 +324,31 @@ Phase 1, early. What exists and is tested:
   stdout, where before this fix the same sequence would have shown "can't
   resume showing its progress."
 
+- **Provider-side dispute visibility.** `GET /providers/me/dashboard` now
+  returns a `disputes` array: every `disputed` reservation on one of the
+  provider's own nodes, joined to its `dispute_resolutions` row (if a
+  tiebreaker has run) via `jobs.verification_group_id`. Before this, a
+  provider watching `rep_jobs_failed` move had no way to find out a
+  duplicate-execution mismatch caused it, let alone whether a later
+  tiebreaker vindicated them or found them at fault. `ProviderDashboard`
+  renders it as a `DisputeHistory` panel with three states per dispute:
+  "Awaiting tiebreaker", "Vindicated", "Fault attributed to this node", or
+  "Inconclusive".
+
+  **A real bug, caught only by checking this live in the browser, not by
+  the first version of the automated test:** the dashboard query originally
+  joined `dispute_resolutions` on `vindicated_reservation_id` /
+  `at_fault_reservation_id`. An `inconclusive` verdict leaves BOTH of those
+  columns NULL by design (nothing gets attributed) -- so that join could
+  never match an inconclusive resolution, and a dispute that had genuinely
+  already been resolved sat forever mislabeled "awaiting tiebreaker". The
+  first test I wrote only exercised the `attributed` case, which happens to
+  populate both columns and passed cleanly, hiding the bug. Fixed by
+  joining through `jobs.verification_group_id` instead -- the one field
+  every resolution always has -- and added a dedicated regression test for
+  the inconclusive case specifically so this class of "only the common case
+  is tested" gap doesn't recur. Backend suite is now 191 tests.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.

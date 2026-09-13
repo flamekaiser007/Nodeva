@@ -75,7 +75,7 @@ export default function ProviderDashboard() {
 
   if (!dashboard) return <div className="text-neutral-500">Loading…</div>
 
-  const { reputation, earnings, nodes } = dashboard
+  const { reputation, earnings, nodes, disputes } = dashboard
 
   return (
     <div className="space-y-4">
@@ -98,6 +98,8 @@ export default function ProviderDashboard() {
         </div>
       </div>
 
+      {disputes.length > 0 && <DisputeHistory disputes={disputes} />}
+
       <div className="flex items-center justify-between">
         <h3 className="font-semibold text-neutral-800">My Machines</h3>
         <button onClick={() => setShowEnroll((s) => !s)}
@@ -116,6 +118,53 @@ export default function ProviderDashboard() {
 
       <div className="grid gap-3">
         {nodes.map((n) => <NodeCard key={n.node_id} node={n} />)}
+      </div>
+    </div>
+  )
+}
+
+const DISPUTE_OUTCOME = {
+  at_fault: { label: 'Fault attributed to this node', className: 'bg-red-50 text-red-700' },
+  vindicated: { label: 'Vindicated', className: 'bg-emerald-50 text-emerald-700' },
+}
+
+// Surfaces WHY rep_jobs_failed moved for a reason nothing else on this
+// dashboard explains: a duplicate-execution mismatch on one of this
+// provider's nodes (docs/security-model.md's Direction 2). Without this, a
+// provider watching their reliability number drop has no way to find out
+// it was a dispute, let alone whether a third-node tiebreaker later
+// vindicated them or found them at fault -- see GET
+// /providers/me/dashboard's `disputes` field and api/server.js's
+// resolveDisputeTiebreaker.
+function DisputeHistory({ disputes }) {
+  return (
+    <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+      <h3 className="mb-2 text-sm font-semibold text-amber-900">Disputes on your nodes</h3>
+      <div className="grid gap-2">
+        {disputes.map((d) => {
+          const outcome = d.resolution ? DISPUTE_OUTCOME[d.resolution.outcome] : null
+          return (
+            <div key={d.reservation_id}
+              className="flex items-center justify-between rounded border border-amber-200 bg-white px-3 py-2 text-sm">
+              <span className="font-mono text-xs text-neutral-500">
+                {d.reservation_id.slice(0, 8)} · {new Date(d.disputed_at).toLocaleDateString()}
+              </span>
+              {outcome ? (
+                <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${outcome.className}`}>
+                  {outcome.label}
+                </span>
+              ) : d.resolution ? (
+                <span className="rounded-full bg-neutral-100 px-2 py-0.5 text-xs font-medium text-neutral-600">
+                  Inconclusive
+                </span>
+              ) : (
+                <span className="rounded-full bg-neutral-100 px-2 py-0.5 text-xs font-medium text-neutral-600">
+                  Awaiting tiebreaker
+                </span>
+              )}
+            </div>
+          )
+        })}
       </div>
     </div>
   )

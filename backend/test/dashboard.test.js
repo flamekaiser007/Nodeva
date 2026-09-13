@@ -57,6 +57,8 @@ test('a fresh provider sees zero nodes, null reliability, zero earnings', { skip
   assert.equal(body.reputation.reliability, null,
     'no jobs yet must read as unknown, not a misleading 0% or 100%');
   assert.equal(body.earnings.available_paise, 0);
+  assert.deepEqual(body.disputes, [],
+    'a provider with no jobs has had no disputes -- see dispute-resolution.test.js for the populated case');
 });
 
 test('an enrolled node appears in the dashboard, offline (no worker connected)', { skip }, async () => {

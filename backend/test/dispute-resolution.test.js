@@ -168,7 +168,7 @@ async function setUpConfirmedReservation(buyerToken, dayOffset) {
   await fetch(`${base}/reservations/${reserveRes.reservation_id}/confirm`, {
     method: 'POST', headers: authed(buyerToken),
   });
-  return { worker, node_id, reservation_id: reserveRes.reservation_id };
+  return { worker, node_id, reservation_id: reserveRes.reservation_id, providerToken: providerAuth.token };
 }
 
 // A second, independent booking against an ALREADY-ENROLLED node -- used to
@@ -392,3 +392,72 @@ test('GET resolution 404s before a tiebreak resolves and returns the verdict aft
   const body = await after.json();
   assert.equal(body.verification_group_id, groupId);
 });
+
+test("a disputed reservation appears on its node's provider dashboard, unresolved until tiebroken",
+  { skip }, async () => {
+    const buyer = await signupBuyer();
+    const { a, b, groupId } = await disputeTwoNodes(buyer, 60);
+
+    const dashA = await json(await fetch(`${base}/providers/me/dashboard`, { headers: authed(a.providerToken) }));
+    assert.equal(dashA.disputes.length, 1);
+    assert.equal(dashA.disputes[0].reservation_id, a.reservation_id);
+    assert.equal(dashA.disputes[0].node_id, a.node_id);
+    assert.equal(dashA.disputes[0].resolution, null, 'no tiebreaker has run yet');
+
+    const dashB = await json(await fetch(`${base}/providers/me/dashboard`, { headers: authed(b.providerToken) }));
+    assert.equal(dashB.disputes.length, 1);
+    assert.equal(dashB.disputes[0].reservation_id, b.reservation_id);
+
+    const c = await setUpConfirmedReservation(buyer.token, 63);
+    c.worker.scriptResult({ status: 'succeeded', exit_code: 0, stdout: 'REAL OUTPUT\n', stderr: '' });
+    await fetch(`${base}/verification-groups/${groupId}/tiebreak`, {
+      method: 'POST', headers: { ...authed(buyer.token), 'content-type': 'application/json' },
+      body: JSON.stringify({ reservation_id: c.reservation_id }),
+    });
+    await waitForResolution(groupId);
+
+    const dashAAfter = await json(await fetch(`${base}/providers/me/dashboard`, { headers: authed(a.providerToken) }));
+    assert.equal(dashAAfter.disputes[0].resolution.verdict, 'attributed');
+    assert.equal(dashAAfter.disputes[0].resolution.outcome, 'vindicated');
+
+    const dashBAfter = await json(await fetch(`${base}/providers/me/dashboard`, { headers: authed(b.providerToken) }));
+    assert.equal(dashBAfter.disputes[0].resolution.verdict, 'attributed');
+    assert.equal(dashBAfter.disputes[0].resolution.outcome, 'at_fault');
+  });
+
+test('a provider with no disputes sees an empty disputes list, not an error', { skip }, async () => {
+  const clean = await json(await fetch(`${base}/auth/signup`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      email: `dispute-clean-provider-${crypto.randomUUID()}@test.local`,
+      password: 'correct horse battery staple', display_name: 'Clean Provider',
+    }),
+  }));
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(clean.token) });
+  const dash = await json(await fetch(`${base}/providers/me/dashboard`, { headers: authed(clean.token) }));
+  assert.deepEqual(dash.disputes, []);
+});
+
+test("an inconclusive tiebreak still shows as resolved on the provider dashboard, not stuck 'awaiting'",
+  { skip }, async () => {
+    // Regression test: dispute_resolutions leaves BOTH
+    // vindicated_reservation_id and at_fault_reservation_id NULL for an
+    // inconclusive verdict, which broke a join keyed on those columns --
+    // caught live in the browser, not by the earlier (attributed-only)
+    // dashboard test, since that case happens to populate both columns.
+    const buyer = await signupBuyer();
+    const { a, groupId } = await disputeTwoNodes(buyer, 70);
+    const c = await setUpConfirmedReservation(buyer.token, 73);
+    c.worker.scriptResult({ status: 'succeeded', exit_code: 0, stdout: 'NEITHER ORIGINAL OUTPUT\n', stderr: '' });
+    await fetch(`${base}/verification-groups/${groupId}/tiebreak`, {
+      method: 'POST', headers: { ...authed(buyer.token), 'content-type': 'application/json' },
+      body: JSON.stringify({ reservation_id: c.reservation_id }),
+    });
+    const resolution = await waitForResolution(groupId);
+    assert.equal(resolution.verdict, 'inconclusive');
+
+    const dash = await json(await fetch(`${base}/providers/me/dashboard`, { headers: authed(a.providerToken) }));
+    assert.equal(dash.disputes[0].resolution.verdict, 'inconclusive',
+      'the dashboard must reflect the resolution, not report it as still pending');
+    assert.equal(dash.disputes[0].resolution.outcome, null);
+  });
