@@ -90,9 +90,10 @@ Phase 1, early. What exists and is tested:
   actually-free slot. Reproduced against a live worker, fixed, and pinned by
   a test that fails the same way the bug did before the fix (a real INSERT
   against a real exclusion constraint, not a mock). Runs opportunistically
-  before a booking attempt and on a 15s sweep. See
-  [docs/reservation-protocol.md](docs/reservation-protocol.md)'s failure
-  matrix for the one related case that's still open.
+  before a booking attempt and on a 15s sweep. The one related case this
+  file's failure matrix once named as still open -- a lost `RESERVE_COMMIT`
+  acknowledgment -- is also closed now; see the `RESERVATION_STATUS_QUERY`
+  entry further down.
 - `backend/src/providers/reputation.js` — another shipped-but-silent gap:
   `providers.rep_jobs_total`/`rep_jobs_failed` were read by the scheduler's
   reliability ranking (`marketplace/nodeStore.js`) but never written by
@@ -157,13 +158,25 @@ Phase 1, early. What exists and is tested:
   refund call) recurring a second time. See
   [docs/payment-architecture.md](docs/payment-architecture.md)'s "Refund
   retries" section.
+- `RESERVATION_STATUS_QUERY` / `RESERVE_RELEASE` (protocol.js) +
+  `hub.queryReservationStatus` / `hub.releaseReservation` +
+  `reservations/reconciler.js`'s `reconcileExpiredMismatches` — closes the
+  last gap `docs/reservation-protocol.md` named as unsolved since the
+  project's first commit: after a `RESERVE_COMMIT` acknowledgment goes
+  missing, the platform could not tell whether the node actually applied the
+  commit before the ack was lost, leaving a slot permanently squatted on by
+  a reservation nobody could act on. A periodic sweep now asks the node
+  directly and, on a mismatch, tells the node to release rather than trying
+  to resurrect the platform's own row -- which would reopen "charged but not
+  reserved" risk from the other direction. Verified live: reproduced the
+  exact scenario against a running backend and a real worker (had the
+  worker apply a commit locally, forced the platform's row to `expired` to
+  simulate the lost ack) and watched the sweep detect it, release the node's
+  hold over the real socket, and free the slot for a genuine rebooking.
 
 Not built yet: account recovery (forgot-password, email verification), P2P
-discovery beyond one platform-worker link, protecting users from malicious
-providers (no result verification / duplicate execution yet), and a
-reservation-status query a platform could use to resolve the one documented
-node/platform state mismatch that can still leave a user stuck (safe -- no
-money or double-booking risk, just a stuck UX).
+discovery beyond one platform-worker link, and protecting users from
+malicious providers (no result verification / duplicate execution yet).
 
 ## Running
 
@@ -174,7 +187,7 @@ for f in backend/migrations/*.sql; do
   docker compose exec -T postgres psql -U nodeva -d nodeva < "$f"
 done
 
-# backend tests (109) -- JWT_SECRET only needed by tests that build the full
+# backend tests (120) -- JWT_SECRET only needed by tests that build the full
 # app (server.js); the unit test files don't call createApp() so most pass
 # without it, but set it anyway to be safe. Several suites (reconciler,
 # reputation-integration, dashboard, payment-flow) additionally need a

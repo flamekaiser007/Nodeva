@@ -15,6 +15,7 @@
 import crypto from 'node:crypto';
 import {
   TYPE, AUTH_TIMEOUT_MS, RESERVE_TIMEOUT_MS, COMMIT_TIMEOUT_MS,
+  STATUS_QUERY_TIMEOUT_MS, RELEASE_TIMEOUT_MS,
   HEARTBEAT_MISS_LIMIT,
   encodeEnvelope, decodeEnvelope,
 } from './protocol.js';
@@ -42,6 +43,8 @@ export class Hub {
     reserveTimeoutMs = RESERVE_TIMEOUT_MS,
     commitTimeoutMs = COMMIT_TIMEOUT_MS,
     jobAckTimeoutMs = RESERVE_TIMEOUT_MS,
+    statusQueryTimeoutMs = STATUS_QUERY_TIMEOUT_MS,
+    releaseTimeoutMs = RELEASE_TIMEOUT_MS,
   } = {}) {
     this._lookupPublicKey = lookupPublicKey;
     this._onHeartbeat = onHeartbeat ?? (() => {});
@@ -54,6 +57,8 @@ export class Hub {
     this._reserveTimeoutMs = reserveTimeoutMs;
     this._commitTimeoutMs = commitTimeoutMs;
     this._jobAckTimeoutMs = jobAckTimeoutMs;
+    this._statusQueryTimeoutMs = statusQueryTimeoutMs;
+    this._releaseTimeoutMs = releaseTimeoutMs;
     // nodeId -> connection state. One live socket per node; a second HELLO
     // for the same node_id replaces the first (the old one is presumed dead
     // or a stale reconnect race, and we trust the newest proof of possession).
@@ -103,6 +108,8 @@ export class Hub {
       case TYPE.COMMIT_FAILED:
       case TYPE.JOB_ACCEPTED:
       case TYPE.JOB_REJECTED:
+      case TYPE.RESERVATION_STATUS:
+      case TYPE.RELEASE_ACK:
         return this._resolvePending(msg);
       case TYPE.JOB_RESULT:
         return this._onJobResult(state.nodeId, msg);
@@ -213,6 +220,31 @@ export class Hub {
     }).then((msg) => {
       if (msg.type === TYPE.COMMIT_FAILED) throw new NodeRefused(msg.reason);
       return msg; // COMMITTED
+    });
+  }
+
+  /** Asks a node what it locally believes about a reservation_id.
+   * Resolves to the node's own status string (or null if it has never heard
+   * of this id), never throws for "the node disagrees" -- disagreement is
+   * exactly the useful signal this exists to surface, not an error. */
+  queryReservationStatus(nodeId, reservationId) {
+    const conn = this._nodes.get(nodeId);
+    if (!conn) return Promise.reject(new NodeOffline(nodeId));
+    return this._sendAwait(conn.socket, reservationId, this._statusQueryTimeoutMs, {
+      type: TYPE.RESERVATION_STATUS_QUERY, reservation_id: reservationId,
+    }).then((msg) => msg.status);
+  }
+
+  /** Tells a node to give up its local hold for a reservation_id,
+   * regardless of what state it is currently in. Used to bring a node back
+   * in sync after the platform has independently decided a reservation is
+   * not going forward (see docs/reservation-protocol.md's failure matrix,
+   * row 5) -- never to resurrect a reservation the platform still wants. */
+  releaseReservation(nodeId, reservationId) {
+    const conn = this._nodes.get(nodeId);
+    if (!conn) return Promise.reject(new NodeOffline(nodeId));
+    return this._sendAwait(conn.socket, reservationId, this._releaseTimeoutMs, {
+      type: TYPE.RESERVE_RELEASE, reservation_id: reservationId,
     });
   }
 

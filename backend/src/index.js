@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { createPool } from './db/pool.js';
 import { createApp, attachWebSocketServer } from './api/server.js';
-import { expireStaleHolds } from './reservations/reconciler.js';
+import { expireStaleHolds, reconcileExpiredMismatches } from './reservations/reconciler.js';
 import { processRefundRetries } from './payments/refunds.js';
 
 const pool = createPool();
@@ -23,6 +23,16 @@ setInterval(() => hub.sweepStale(), 15_000);
 setInterval(() => {
   expireStaleHolds(pool).catch((e) => console.error('reconciler sweep failed:', e));
 }, 15_000);
+
+// The reservation-status-query reconciliation: for the narrower, rarer case
+// where the platform lost a RESERVE_COMMIT acknowledgment and marked a
+// reservation 'expired' without knowing whether the node actually applied
+// it (docs/reservation-protocol.md's failure matrix, row 5). Runs less
+// often than the others -- it involves a network round trip PER candidate
+// reservation, unlike the other two sweeps which are pure SQL.
+setInterval(() => {
+  reconcileExpiredMismatches(pool, hub).catch((e) => console.error('mismatch reconciliation sweep failed:', e));
+}, 60_000);
 
 // Retries a compensating refund that failed on its first attempt (gateway
 // outage, network blip, rate limit) -- see payments/refunds.js. A no-op

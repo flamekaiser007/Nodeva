@@ -187,3 +187,57 @@ test('a heartbeat in between sweeps resets the counter so the node is not droppe
   hub.sweepStale(); hub.sweepStale(); hub.sweepStale();
   assert.equal(hub.isOnline('n1'), true);
 });
+
+// --- reconciliation: querying and releasing a node's local reservation state ---
+
+test('queryReservationStatus asks the node and resolves to whatever it reports', async () => {
+  const kp = keypair();
+  const hub = new Hub({ lookupPublicKey: async () => kp.raw });
+  const sock = await authed(hub, 'n1', kp);
+  const p = hub.queryReservationStatus('n1', 'r1');
+  const pushed = sock.lastSent();
+  assert.equal(pushed.type, TYPE.RESERVATION_STATUS_QUERY);
+  assert.equal(pushed.reservation_id, 'r1');
+  sock.receive({ type: TYPE.RESERVATION_STATUS, reservation_id: 'r1', status: 'confirmed' });
+  assert.equal(await p, 'confirmed');
+});
+
+test('queryReservationStatus resolves to null, not a throw, when the node has never heard of the id', async () => {
+  // A node correctly saying "I don't know this reservation" is a valid,
+  // useful answer -- not the same thing as the node being unreachable.
+  const kp = keypair();
+  const hub = new Hub({ lookupPublicKey: async () => kp.raw });
+  const sock = await authed(hub, 'n1', kp);
+  const p = hub.queryReservationStatus('n1', 'r-unknown');
+  sock.receive({ type: TYPE.RESERVATION_STATUS, reservation_id: 'r-unknown', status: null });
+  assert.equal(await p, null);
+});
+
+test('queryReservationStatus rejects fast for an offline node, same as the other node-facing calls', async () => {
+  const hub = new Hub({ lookupPublicKey: async () => null });
+  await assert.rejects(hub.queryReservationStatus('nobody', 'r1'), NodeOffline);
+});
+
+test('queryReservationStatus times out rather than hanging if the node never answers', async () => {
+  const kp = keypair();
+  const hub = new Hub({ lookupPublicKey: async () => kp.raw, statusQueryTimeoutMs: 20 });
+  await authed(hub, 'n1', kp);
+  await assert.rejects(hub.queryReservationStatus('n1', 'r1'), NodeTimeout);
+});
+
+test('releaseReservation asks the node to give up its hold and resolves on RELEASE_ACK', async () => {
+  const kp = keypair();
+  const hub = new Hub({ lookupPublicKey: async () => kp.raw });
+  const sock = await authed(hub, 'n1', kp);
+  const p = hub.releaseReservation('n1', 'r1');
+  const pushed = sock.lastSent();
+  assert.equal(pushed.type, TYPE.RESERVE_RELEASE);
+  assert.equal(pushed.reservation_id, 'r1');
+  sock.receive({ type: TYPE.RELEASE_ACK, reservation_id: 'r1' });
+  await p; // must resolve, not throw
+});
+
+test('releaseReservation rejects fast for an offline node', async () => {
+  const hub = new Hub({ lookupPublicKey: async () => null });
+  await assert.rejects(hub.releaseReservation('nobody', 'r1'), NodeOffline);
+});

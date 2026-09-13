@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createPool } from '../src/db/pool.js';
-import { expireStaleHolds } from '../src/reservations/reconciler.js';
+import { expireStaleHolds, reconcileExpiredMismatches } from '../src/reservations/reconciler.js';
 
 const DATABASE_URL = process.env.DATABASE_URL
   ?? 'postgresql://nodeva:nodeva_dev@localhost:5433/nodeva';
@@ -53,13 +53,13 @@ async function seed(overrides = {}) {
   return { userId, nodeId, ...overrides };
 }
 
-async function insertReservation(pool, { userId, nodeId, status, holdExpiresAt, start, end }) {
+async function insertReservation(pool, { userId, nodeId, status, holdExpiresAt, start, end, receiptSig }) {
   const id = crypto.randomUUID();
   await pool.query(
     `INSERT INTO reservations
-       (reservation_id, node_id, user_id, slot, price_paise_hr, quoted_paise, status, hold_expires_at)
-     VALUES ($1,$2,$3, tstzrange($4,$5), 4300, 4300, $6, $7)`,
-    [id, nodeId, userId, start, end, status, holdExpiresAt]);
+       (reservation_id, node_id, user_id, slot, price_paise_hr, quoted_paise, status, hold_expires_at, receipt_sig)
+     VALUES ($1,$2,$3, tstzrange($4,$5), 4300, 4300, $6, $7, $8)`,
+    [id, nodeId, userId, start, end, status, holdExpiresAt, receiptSig ?? null]);
   return id;
 }
 
@@ -148,4 +148,103 @@ test('expiring a stale hold frees the slot for a real overlapping insert', { ski
     userId, nodeId, status: 'held', holdExpiresAt: new Date(Date.now() + 60_000), start, end,
   });
   assert.equal(await statusOf(pool, secondId), 'held');
+});
+
+// --- reconcileExpiredMismatches -------------------------------------------
+//
+// A fake hub, not a fake reservation or ledger: this function's whole job is
+// to ask a node a question and act on the answer, so what needs faking is
+// the network conversation, not the database.
+function fakeHub({ online = true, statusReply = null, releaseCalls = [] } = {}) {
+  return {
+    isOnline: () => online,
+    queryReservationStatus: async () => statusReply,
+    releaseReservation: async (nodeId, reservationId) => {
+      releaseCalls.push({ nodeId, reservationId });
+    },
+  };
+}
+
+async function reconciledAt(pool, id) {
+  const { rows } = await pool.query('SELECT reconciled_at FROM reservations WHERE reservation_id=$1', [id]);
+  return rows[0]?.reconciled_at;
+}
+
+test('an expired reservation with no receipt on file is not a mismatch candidate at all', { skip }, async () => {
+  // No RESERVE_COMMIT was ever attempted for this one (it never got past
+  // the initial hold) -- nothing to reconcile, and querying the node about
+  // it would be a wasted round trip for a case that cannot mismatch.
+  const { userId, nodeId } = await seed();
+  const id = await insertReservation(pool, {
+    userId, nodeId, status: 'expired', holdExpiresAt: new Date(Date.now() - 60_000),
+    start: new Date('2027-02-01T10:00:00Z'), end: new Date('2027-02-01T11:00:00Z'),
+    receiptSig: null,
+  });
+  const releaseCalls = [];
+  const result = await reconcileExpiredMismatches(pool, fakeHub({ releaseCalls }));
+  assert.equal(releaseCalls.length, 0);
+  assert.equal(await reconciledAt(pool, id), null, 'nothing to check, nothing to mark checked');
+});
+
+test('the node agreeing (not confirmed) needs no release, and is marked checked', { skip }, async () => {
+  const { userId, nodeId } = await seed();
+  const id = await insertReservation(pool, {
+    userId, nodeId, status: 'expired', holdExpiresAt: new Date(Date.now() - 60_000),
+    start: new Date('2027-02-02T10:00:00Z'), end: new Date('2027-02-02T11:00:00Z'),
+    receiptSig: Buffer.from('sig'),
+  });
+  const releaseCalls = [];
+  const result = await reconcileExpiredMismatches(pool, fakeHub({ statusReply: 'released', releaseCalls }));
+  assert.equal(result.checked, 1);
+  assert.equal(result.mismatchesReleased, 0);
+  assert.equal(releaseCalls.length, 0);
+  assert.ok(await reconciledAt(pool, id), 'checked once, should not be re-queried forever');
+});
+
+test('the real bug this exists for: node says CONFIRMED, platform says expired -- gets released', { skip }, async () => {
+  const { userId, nodeId } = await seed();
+  const id = await insertReservation(pool, {
+    userId, nodeId, status: 'expired', holdExpiresAt: new Date(Date.now() - 60_000),
+    start: new Date('2027-02-03T10:00:00Z'), end: new Date('2027-02-03T11:00:00Z'),
+    receiptSig: Buffer.from('sig'),
+  });
+  const releaseCalls = [];
+  const result = await reconcileExpiredMismatches(pool, fakeHub({ statusReply: 'confirmed', releaseCalls }));
+  assert.equal(result.mismatchesReleased, 1);
+  assert.deepEqual(releaseCalls, [{ nodeId, reservationId: id }]);
+  assert.ok(await reconciledAt(pool, id));
+
+  // The important non-side-effect: the platform's own row is NOT resurrected
+  // to 'confirmed' -- that would reopen the exact "charged but not
+  // reserved" risk machine.js's illegal transitions exist to prevent, from
+  // the other direction. It stays 'expired'; the NODE is the one that moves.
+  assert.equal(await statusOf(pool, id), 'expired');
+});
+
+test('an offline node is skipped, not marked checked, so a later sweep retries it', { skip }, async () => {
+  const { userId, nodeId } = await seed();
+  const id = await insertReservation(pool, {
+    userId, nodeId, status: 'expired', holdExpiresAt: new Date(Date.now() - 60_000),
+    start: new Date('2027-02-04T10:00:00Z'), end: new Date('2027-02-04T11:00:00Z'),
+    receiptSig: Buffer.from('sig'),
+  });
+  const result = await reconcileExpiredMismatches(pool, fakeHub({ online: false }));
+  assert.equal(result.checked, 0);
+  assert.equal(await reconciledAt(pool, id), null, 'must stay unreconciled so a future sweep, once the node is back, retries it');
+});
+
+test('an already-reconciled row is not queried a second time', { skip }, async () => {
+  const { userId, nodeId } = await seed();
+  const id = await insertReservation(pool, {
+    userId, nodeId, status: 'expired', holdExpiresAt: new Date(Date.now() - 60_000),
+    start: new Date('2027-02-05T10:00:00Z'), end: new Date('2027-02-05T11:00:00Z'),
+    receiptSig: Buffer.from('sig'),
+  });
+  await reconcileExpiredMismatches(pool, fakeHub({ statusReply: 'released' }));
+  let queried = 0;
+  const hub = fakeHub({ statusReply: 'released' });
+  hub.queryReservationStatus = async () => { queried += 1; return 'released'; };
+  const result = await reconcileExpiredMismatches(pool, hub);
+  assert.equal(queried, 0, 'a row already marked reconciled must not be picked up again');
+  assert.equal(result.checked, 0);
 });

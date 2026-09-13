@@ -106,6 +106,8 @@ class WorkerLink:
                 "RESERVE_REQUEST": self._on_reserve_request,
                 "RESERVE_COMMIT": self._on_reserve_commit,
                 "JOB_SUBMIT": self._on_job_submit,
+                "RESERVATION_STATUS_QUERY": self._on_status_query,
+                "RESERVE_RELEASE": self._on_release,
             }.get(msg["type"])
             if handler is None:
                 log.warning("unhandled message type %s", msg["type"])
@@ -145,6 +147,26 @@ class WorkerLink:
             **({} if ok else {"reason": "hold_expired_or_unknown"}),
         }))
         log.info("commit %s for %s", "accepted" if ok else "REJECTED", rid)
+
+    async def _on_status_query(self, ws, msg):
+        rid = msg["reservation_id"]
+        status = self.store.status_of(rid)
+        await ws.send(json.dumps({
+            "type": "RESERVATION_STATUS", "reservation_id": rid, "status": status,
+        }))
+        log.info("reported status %s for %s", status, rid)
+
+    async def _on_release(self, ws, msg):
+        # Unconditional, deliberately: the platform asking for a release
+        # means it has already decided this reservation is not going
+        # forward on its side (see docs/reservation-protocol.md's failure
+        # matrix, row 5). The node's job here is to agree, not to argue --
+        # refusing would leave the slot permanently squatted on by a
+        # reservation the platform has no way to act on any more.
+        rid = msg["reservation_id"]
+        self.store.release(rid)
+        await ws.send(json.dumps({"type": "RELEASE_ACK", "reservation_id": rid}))
+        log.info("released %s on platform request", rid)
 
     async def _on_job_submit(self, ws, msg):
         job_id = msg["job_id"]

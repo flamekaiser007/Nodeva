@@ -58,7 +58,7 @@ charged. This is why `expired → confirmed` is an illegal transition in
 | Platform crashes pre-capture | lock expires via TTL | `held → expired` | not charged |
 | Gateway declines | lock expires via TTL | `held → expired` | not charged |
 | User abandons a `held` reservation (never confirms) | lock expires via TTL | **was stuck at `held` forever — see below** | not charged, but see below |
-| `RESERVE_COMMIT` ack lost after the node applied it | **permanently confirmed, no TTL** | `held → expired` (the confirm handler treats any timeout/disconnect as failure) | not charged, but see below |
+| `RESERVE_COMMIT` ack lost after the node applied it | permanently confirmed, no TTL — **until the reconciler queries and releases it** | `held → expired` (the confirm handler treats any timeout/disconnect as failure) | not charged; slot recovers within one reconciliation sweep instead of staying stuck forever |
 | Node vanishes mid-job | — | `running → failed_provider` | full refund |
 | User's code throws | — | `running → failed_user` | billed for compute consumed |
 
@@ -77,31 +77,46 @@ might collide with a stale hold of its own) and on a periodic sweep (every
 path involves money — nothing is captured until `confirm`, so this is a slot
 being falsely reported unavailable, not a billing error.
 
-Row five is the case that would need a refund if it ever produced a mismatch
-long enough to matter, but by construction it currently cannot silently cost
-anyone money: the confirm handler treats *any* timeout or disconnect while
-waiting for `COMMITTED` as a failure and marks the reservation `expired`
-without ever capturing payment — see the `node_unreachable_hold_not_confirmed`
-path in `server.js`. The residual risk is a pure state *mismatch*, not a
-financial one: the node may have actually applied the commit permanently
-(no TTL) while the platform believes the slot is free again. A second user
-attempting to book that window is safely, correctly denied by the node
-itself (a real conflict, not a false one this time) — the awkward outcome is
-that the first user is told their booking expired when the node would in
-fact have run their job, and has no way to retry it since the slot now
-reads as taken. No money changes hands incorrectly, but the user experience
-is broken. Resolving it needs the platform to be able to *ask* a node "is
-reservation X actually confirmed on your side?" — a query this protocol does
-not have yet, tracked in "what is not solved" below.
+Row five was also a real, shipped, then-unsolved gap — the last thing this
+document named as missing, now fixed. By construction it never risked money:
+the confirm handler treats *any* timeout or disconnect while waiting for
+`COMMITTED` as a failure and marks the reservation `expired` without ever
+capturing payment — see the `node_unreachable_hold_not_confirmed` path in
+`server.js`. What it left was a pure state *mismatch*: the node may have
+actually applied the commit permanently (no TTL) while the platform believed
+the slot was free again. A second user attempting to book that window was
+safely, correctly denied by the node itself (a real conflict, not a false
+one) — but the first user was told their booking expired when the node would
+in fact have run their job, with no path to retry since the slot read as
+taken, and the slot itself stayed permanently squatted on by a reservation
+nobody could act on.
+
+Fixed with the query this section used to say the protocol didn't have:
+`RESERVATION_STATUS_QUERY` (backend → node, "what do you show for X?") and
+`RESERVE_RELEASE` (backend → node, "give it up"), both in
+`backend/src/ws/protocol.js`, driven by `hub.queryReservationStatus` /
+`hub.releaseReservation` and a periodic sweep,
+`reservations/reconciler.js`'s `reconcileExpiredMismatches` (every 60s in
+`index.js` — less often than the other sweeps, since this one costs a real
+network round trip per candidate row, not pure SQL). It deliberately does
+**not** resurrect the platform's own reservation back to `confirmed` — that
+would reopen "charged but not reserved" risk from the other direction, the
+exact thing `machine.js`'s illegal `expired → confirmed` transition exists
+to prevent. Instead it tells the *node* to release, so both sides agree the
+slot is free and it becomes bookable again; the first user's inconvenience
+is real but no longer permanent, and involves no money either way.
+
+Verified live, not just in tests: reproduced the exact scenario against a
+running backend and a real worker process (had the worker apply a commit
+locally via its normal code path, then forced the platform's row to
+`expired` to simulate the lost acknowledgment) and confirmed the periodic
+sweep found the mismatch, sent a real `RESERVE_RELEASE` over the actual
+socket, the worker's local status flipped from `confirmed` to `released`,
+the platform's row correctly stayed `expired` rather than being resurrected,
+and the identical slot could genuinely be rebooked afterward.
 
 ## What is NOT solved yet
 
-- **Reconciliation query.** There is no `RESERVATION_STATUS?` message a
-  platform can send a node to ask "what do you actually show for X" after a
-  commit ack goes missing. Today that mismatch resolves itself safely
-  (double-booking stays impossible) but leaves the affected user stuck with
-  no path to their own confirmed slot. Low-frequency edge case, real UX cost
-  when it happens.
 - **Byzantine nodes.** A node can sign a receipt and then simply not run the
   job. Detection today is the heartbeat; the economic answer is reputation plus
   selective duplicate execution, not cryptography.
