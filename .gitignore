@@ -1,0 +1,27 @@
+# dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# build / runtime
+dist/
+build/
+*.log
+coverage/
+
+# local state
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+worker-state/
+
+# os
+.DS_Store
