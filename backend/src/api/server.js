@@ -9,6 +9,7 @@
 // user row for exercising the reservation flow and must not ship as-is.
 
 import express from 'express';
+import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import crypto from 'node:crypto';
 import { Hub, NodeOffline, NodeRefused, NodeTimeout } from '../ws/hub.js';
@@ -20,6 +21,10 @@ import { S, canTransition, SETTLEMENT } from '../reservations/machine.js';
 
 export function createApp(pool) {
   const app = express();
+  // Dev-permissive CORS: the frontend runs on a different origin (Vite's
+  // dev server). Not something to carry into a real deployment unchanged --
+  // production should allow-list the actual frontend origin, not '*'.
+  app.use(cors());
   app.use(express.json());
 
   const hub = new Hub({
@@ -45,10 +50,11 @@ export function createApp(pool) {
     onJobResult: async (nodeId, msg) => {
       try {
         const { rows } = await pool.query(
-          `UPDATE jobs SET status=$2, exit_code=$3, compute_seconds=$4, completed_at=now()
+          `UPDATE jobs SET status=$2, exit_code=$3, compute_seconds=$4,
+                  stdout=$5, stderr=$6, completed_at=now()
              WHERE job_id=$1 RETURNING reservation_id`,
           [msg.job_id, mapJobStatus(msg.status), msg.exit_code,
-           Math.round(msg.duration_seconds ?? 0)]);
+           Math.round(msg.duration_seconds ?? 0), msg.stdout ?? null, msg.stderr ?? null]);
         const reservationId = rows[0]?.reservation_id;
         if (!reservationId) {
           console.error(`JOB_RESULT for unknown job ${msg.job_id}`);
@@ -111,6 +117,18 @@ export function createApp(pool) {
         [provider_id, pub, gpu_model, gpu_vram_mb, cpu_cores, ram_mb,
          price_paise_hr, cuda_version ?? null]);
       res.status(201).json({ node_id: rows[0].node_id });
+    } catch (e) { next(e); }
+  });
+
+  app.get('/nodes', async (req, res, next) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT n.node_id, n.gpu_model, n.gpu_vram_mb, n.cpu_cores, n.ram_mb,
+                n.price_paise_hr, n.status, n.last_seen_at, n.created_at,
+                p.rep_jobs_total, p.rep_jobs_failed
+           FROM compute_nodes n JOIN providers p ON p.provider_id = n.provider_id
+          ORDER BY n.created_at DESC`);
+      res.json({ nodes: rows });
     } catch (e) { next(e); }
   });
 

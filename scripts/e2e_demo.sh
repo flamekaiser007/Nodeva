@@ -37,7 +37,9 @@ echo "== resetting schema =="
 docker compose up -d postgres >/dev/null
 for i in $(seq 1 25); do docker compose exec -T postgres pg_isready -U nodeva >/dev/null 2>&1 && break; sleep 1; done
 docker compose exec -T postgres psql -U nodeva -d nodeva -q -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;" >/dev/null
-docker compose exec -T postgres psql -U nodeva -d nodeva -v ON_ERROR_STOP=1 -q < backend/migrations/001_init.sql >/dev/null
+for f in backend/migrations/*.sql; do
+  docker compose exec -T postgres psql -U nodeva -d nodeva -v ON_ERROR_STOP=1 -q < "$f" >/dev/null
+done
 
 echo "== starting backend =="
 # `exec` replaces the subshell's own process image with node, so $! is

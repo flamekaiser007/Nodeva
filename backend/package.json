@@ -8,6 +8,7 @@
     "migrate": "node src/db/migrate.js"
   },
   "dependencies": {
+    "cors": "^2.8.6",
     "express": "^4.22.2",
     "pg": "^8.23.0",
     "ws": "^8.21.3"

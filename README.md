@@ -70,17 +70,26 @@ Phase 1, early. What exists and is tested:
   receipt, a denied double-booking from the running node, an exact ledger
   settlement, and detection of a killed worker process. Not mocked.
 
+- `frontend/` — React + Tailwind marketplace UI: requirement-based search
+  (not a GPU-model picker), reserve, confirm & pay, submit a job, watch it
+  run. Verified against the real running stack end to end -- a browser
+  click produces a signed reservation receipt, runs a real Docker container
+  on the worker, and settles the ledger, with the actual container stdout
+  displayed back in the page.
+
 Not built yet: user auth (the API has a dev-only user-seeding stub, clearly
-marked, not real signup/login), frontend, P2P discovery beyond one
-platform-worker link, protecting users from malicious providers (no result
-verification / duplicate execution yet).
+marked, not real signup/login), P2P discovery beyond one platform-worker
+link, protecting users from malicious providers (no result verification /
+duplicate execution yet).
 
 ## Running
 
 ```bash
 # schema
 docker compose up -d postgres
-docker compose exec -T postgres psql -U nodeva -d nodeva < backend/migrations/001_init.sql
+for f in backend/migrations/*.sql; do
+  docker compose exec -T postgres psql -U nodeva -d nodeva < "$f"
+done
 
 # backend tests (33)
 cd backend && node --test test/*.test.js
@@ -95,6 +104,11 @@ python3 -m venv .venv && .venv/bin/pip install -r worker/requirements-dev.txt
 
 # full network integration demo, including a real sandboxed job (needs docker)
 ./scripts/e2e_demo.sh
+
+# frontend (needs the backend + a worker running -- see scripts/e2e_demo.sh
+# for how to start one by hand, or just run that script and query the API
+# it leaves in place while it's mid-run)
+cd frontend && npm install && npm run dev
 ```
 
 The signature fixtures shared by both suites are regenerated with
