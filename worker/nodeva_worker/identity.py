@@ -68,6 +68,16 @@ class NodeIdentity:
     def sign_body(self, body: dict) -> bytes:
         return self._sk.sign(encode(body))
 
+    def sign_raw(self, data: bytes) -> bytes:
+        """Sign bytes directly, bypassing canonical encoding.
+
+        For values that are not themselves a canonical JSON body — the auth
+        challenge nonce is a bare string the backend generates and compares
+        byte-for-byte, not a dict, so running it through encode() would sign
+        the wrong bytes (a quoted JSON string) and fail to verify.
+        """
+        return self._sk.sign(data)
+
 
 def verify_body(public_key_raw: bytes, body: dict, signature: bytes) -> bool:
     from cryptography.exceptions import InvalidSignature

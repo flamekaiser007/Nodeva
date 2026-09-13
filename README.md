@@ -49,8 +49,22 @@ Phase 1, early. What exists and is tested:
   here verify in the backend, proven by a cross-language test.
 - `worker/nodeva_worker/hardware.py` — GPU detection, advertising only VRAM
   that is actually free.
+- `backend/src/ws/hub.js` + `worker/nodeva_worker/link.py` — the transport.
+  The worker dials **out** and stays connected, because most consumer GPUs
+  sit behind NAT and cannot accept an inbound connection; the platform pushes
+  reservation requests down that connection instead. Auth is
+  challenge-response against the node's registered public key, not a bearer
+  token — proving possession of the private key on every connection.
+- `backend/src/api/server.js` — HTTP API: enroll a node, search, reserve,
+  confirm (capture into escrow), complete (settle 90/10 or refund).
+- `scripts/e2e_demo.sh` — boots a real Postgres, backend, and Python worker
+  and drives the full loop over an actual network connection: a live signed
+  receipt, a denied double-booking from the running node, an exact ledger
+  settlement, and detection of a killed worker process. Not mocked.
 
-Not built yet: HTTP API, job execution/sandboxing, frontend, P2P.
+Not built yet: user auth (the API has a dev-only user-seeding stub, clearly
+marked, not real signup/login), job execution/sandboxing, frontend, P2P
+discovery beyond one platform-worker link.
 
 ## Running
 
@@ -64,7 +78,11 @@ cd backend && node --test test/*.test.js
 
 # worker tests (20)
 python3 -m venv .venv && .venv/bin/pip install -r worker/requirements-dev.txt
+.venv/bin/pip install websockets
 .venv/bin/python -m pytest worker/tests -q
+
+# full network integration demo (needs docker)
+./scripts/e2e_demo.sh
 ```
 
 The signature fixtures shared by both suites are regenerated with

@@ -74,6 +74,9 @@ refunds them. Everything else is self-healing.
 - **Clock skew.** Hold TTLs compare timestamps across machines. Currently
   assumes loose NTP sync; a node with a fast clock releases early. Needs a
   monotonic handshake or a generous safety margin before production.
-- **NAT.** This diagram assumes the platform can reach the node. Most consumer
-  GPUs are behind CGNAT and cannot accept inbound connections. Phase 1 sidesteps
-  it with node-initiated WebSocket; Phase 2 needs relays.
+- **NAT — solved for Phase 1, not for Phase 2.** The worker dials out over
+  WebSocket and holds the connection open; the platform never opens a socket
+  to a node. This works today because there is exactly one platform to
+  connect to. It stops working once nodes need to reach each other directly
+  for P2P discovery (Phase 2), which is a harder problem (relays, hole
+  punching) than a single long-lived client connection to a known server.

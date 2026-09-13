@@ -1,0 +1,63 @@
+// Postgres-backed view of compute_nodes, joined with live hub presence.
+//
+// Reiterating the design boundary: this is a SEARCH INDEX. `status='online'`
+// here means "the node's last heartbeat said so", not "the node is reachable
+// right now" — the hub's in-memory presence is closer to ground truth than
+// this column is, which is why searchCandidates cross-checks both.
+
+export async function searchCandidates(pool, hub, req) {
+  // Broad SQL prefilter (index-friendly columns), fine-grained window and
+  // scoring logic stays in scheduler.js so it is shared with tests that don't
+  // touch a database at all.
+  const { rows } = await pool.query(
+    `SELECT n.node_id, n.gpu_model, n.gpu_vram_mb, n.cpu_cores, n.ram_mb,
+            n.price_paise_hr, n.perf_score, n.status,
+            p.rep_jobs_total, p.rep_jobs_failed
+       FROM compute_nodes n
+       JOIN providers p ON p.provider_id = n.provider_id
+       WHERE n.status = 'online'
+         AND n.gpu_vram_mb >= $1 AND n.cpu_cores >= $2 AND n.ram_mb >= $3
+         AND ($4::bigint IS NULL OR n.price_paise_hr <= $4)`,
+    [req.min_vram_mb, req.min_cpu_cores, req.min_ram_mb, req.max_price_paise_hr ?? null],
+  );
+
+  const nodeIds = rows.map((r) => r.node_id);
+  const availability = nodeIds.length
+    ? await pool.query(
+        `SELECT node_id, window_start, window_end FROM node_availability
+          WHERE node_id = ANY($1::uuid[])
+            AND window_end >= $2 AND window_start <= $3`,
+        [nodeIds, new Date(req.starts_at), new Date(req.ends_at)],
+      )
+    : { rows: [] };
+
+  const windowsByNode = new Map();
+  for (const a of availability.rows) {
+    const list = windowsByNode.get(a.node_id) ?? [];
+    list.push({ start: a.window_start.getTime(), end: a.window_end.getTime() });
+    windowsByNode.set(a.node_id, list);
+  }
+
+  return rows
+    // The database's `online` is advisory; require the hub to agree the
+    // socket is actually up before we let a user try to book it.
+    .filter((r) => hub.isOnline(r.node_id))
+    .map((r) => ({
+      id: r.node_id,
+      status: r.status,
+      gpu_model: r.gpu_model,
+      gpu_vram_mb: r.gpu_vram_mb,
+      cpu_cores: r.cpu_cores,
+      ram_mb: r.ram_mb,
+      price_paise_hr: r.price_paise_hr,
+      perf_score: r.perf_score,
+      // No verified track record yet defaults to a neutral prior rather than
+      // 0 (which would bury every new provider under the reliability term)
+      // or 1 (which would let a brand-new node masquerade as proven).
+      reliability: r.rep_jobs_total > 0
+        ? 1 - r.rep_jobs_failed / r.rep_jobs_total
+        : 0.8,
+      latency_ms: 50, // placeholder until real RTT measurement lands (Phase 2)
+      availability: windowsByNode.get(r.node_id) ?? [],
+    }));
+}
