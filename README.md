@@ -349,6 +349,30 @@ Phase 1, early. What exists and is tested:
   the inconclusive case specifically so this class of "only the common case
   is tested" gap doesn't recur. Backend suite is now 191 tests.
 
+- **Rate limiting on the three auth endpoints exposed before a session
+  exists** (`auth/rateLimit.js`): `/auth/signup` (spam accounts),
+  `/auth/forgot-password` (email-bombing a stranger's inbox -- the
+  endpoint deliberately sends regardless of whether the account exists, to
+  avoid leaking which emails are registered, which means nothing else
+  stopped this), and `/auth/login` gets TWO limiters at once -- by IP (one
+  source hammering many accounts) and by email (one account targeted from
+  many sources) -- since either alone misses half the threat. In-memory,
+  fixed-window, honestly labeled as per-process state: correct for the
+  single backend instance this MVP runs, wrong the moment a second
+  instance joins without a shared store. Redis is already sitting unused in
+  `docker-compose.yml`; that would be the natural next step, not something
+  to build ahead of the actual need. Thresholds (100/15min signup by IP,
+  50/15min login by IP, 8/15min login by email, 10/15min forgot-password by
+  IP) are illustrative starting points, the same posture
+  `jobs/verification.js`'s thresholds already take.
+
+  Tested at two levels: `rateLimit.test.js` proves the middleware itself
+  (independent keys don't interfere, a falsy key is never limited, the
+  window actually resets) against a fake req/res, no HTTP needed;
+  `rate-limit-integration.test.js` proves it's actually wired into the real
+  app on a real route, hitting `/auth/login` for real until the 429 lands.
+  Full suite is now 198 tests.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.

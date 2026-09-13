@@ -21,6 +21,7 @@ import { hashPassword, verifyPassword } from '../auth/password.js';
 import { requireJwtSecret, signSession } from '../auth/jwt.js';
 import { requireAuth } from '../auth/middleware.js';
 import { generateResetToken, hashResetToken } from '../auth/passwordReset.js';
+import { rateLimit } from '../auth/rateLimit.js';
 import { createEmailSenderFromEnv, resetPasswordEmailBody } from '../auth/email.js';
 import {
   createGatewayFromEnv, verifyPaymentSignature, verifyWebhookSignature,
@@ -48,6 +49,22 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   const app = express();
   const jwtSecret = requireJwtSecret();
   const auth = requireAuth(jwtSecret);
+
+  // Rate limits for the three auth endpoints exposed to abuse before a
+  // session even exists (see auth/rateLimit.js for the honest per-process
+  // limitation and why the thresholds are illustrative, not researched).
+  // Login gets TWO limiters: by IP (a single source hammering many
+  // accounts) and by email (one account targeted from many sources,
+  // e.g. a botnet) -- either alone misses half the threat.
+  const signupLimiter = rateLimit({ windowMs: 15 * 60_000, max: 100, keyFn: (req) => `signup:${req.ip}` });
+  const loginLimiterByIp = rateLimit({ windowMs: 15 * 60_000, max: 50, keyFn: (req) => `login-ip:${req.ip}` });
+  const loginLimiterByEmail = rateLimit({
+    windowMs: 15 * 60_000, max: 8,
+    keyFn: (req) => req.body?.email && `login-email:${String(req.body.email).toLowerCase()}`,
+  });
+  const forgotPasswordLimiter = rateLimit({
+    windowMs: 15 * 60_000, max: 10, keyFn: (req) => `forgot-password:${req.ip}`,
+  });
   // Injectable for tests; defaults to reading RAZORPAY_KEY_ID/SECRET from the
   // environment. Falls back to UnconfiguredGateway (loud, honest, ledger-only)
   // when they are absent -- see payments/razorpay.js's file header for what
@@ -176,7 +193,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
 
   // --- auth ------------------------------------------------------------
 
-  app.post('/auth/signup', async (req, res, next) => {
+  app.post('/auth/signup', signupLimiter, async (req, res, next) => {
     try {
       const { email, password, display_name } = req.body;
       if (!email || !password || !display_name) {
@@ -208,7 +225,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
     }
   });
 
-  app.post('/auth/login', async (req, res, next) => {
+  app.post('/auth/login', loginLimiterByIp, loginLimiterByEmail, async (req, res, next) => {
     try {
       const { email, password } = req.body;
       const { rows } = await pool.query(
@@ -240,7 +257,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   // applied to the response body instead of response time. A password-reset
   // endpoint that says "no account with that email" is a very convenient
   // oracle for finding out who has an account here.
-  app.post('/auth/forgot-password', async (req, res, next) => {
+  app.post('/auth/forgot-password', forgotPasswordLimiter, async (req, res, next) => {
     const GENERIC_RESPONSE = { message: 'If an account exists for that email, a reset link has been sent.' };
     try {
       const { email } = req.body;
