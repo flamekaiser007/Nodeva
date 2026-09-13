@@ -388,6 +388,38 @@ Phase 1, early. What exists and is tested:
   reaches the worker's `docker run` at all, using a scripted worker that
   records whether `JOB_SUBMIT` ever arrived. Full suite is now 211 tests.
 
+- **A reproducible scheduler/verification-threshold backtest** --
+  `backend/scripts/scheduler_simulation.js` -- the master brief's own
+  scheduling-research direction, done as far as it can go without real
+  production traffic. Runs the REAL `rank()` and
+  `shouldRecommendVerification()` (not reimplementations) against a
+  synthetic provider population and job stream, under an explicitly stated
+  and honestly-flagged-as-guesswork model (85%/15% reliable/flaky mix, 40%
+  brand-new providers, price weakly anti-correlated with reliability).
+  `jobs/verification.js`'s thresholds became an overridable
+  `DEFAULT_VERIFICATION_THRESHOLDS` object (backward compatible -- every
+  real call site still gets the exact same defaults) specifically so the
+  sweep can vary them without forking the decision logic.
+
+  Findings, written up in `docs/scheduler-tuning.md`: reliability-adjusted
+  ranking (`best_value`) only modestly beats `cheapest` on failure rate
+  (7% relative reduction) under this model, while `fastest` mode nearly
+  doubles the failure rate of the other two (weighting reliability at only
+  20%) -- a real, assumption-robust cost of that mode's tradeoff that
+  wasn't previously quantified anywhere. More surprising: the verification
+  recommendation is close to inert for `best_value`/`fastest`'s actual top
+  pick, because those modes' own reliability weighting already filters out
+  the new/flaky candidates the flag exists to catch -- its practical value
+  concentrates almost entirely in `cheapest` mode. The doc deliberately
+  stops short of changing the shipped defaults from a synthetic sweep
+  alone (that would overclaim what a stated-assumption model can prove);
+  it recommends specifically what to re-check once real traffic exists.
+  Tested with a reproducible-seed smoke suite (`scheduler_simulation.test.js`)
+  rather than fixed-output assertions, since there's no "correct" failure
+  rate to assert against for a stated-assumption model -- only that it
+  doesn't crash, stays internally consistent, and reproduces exactly given
+  the same seed. Full suite is now 220 tests.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.

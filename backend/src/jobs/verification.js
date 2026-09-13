@@ -63,10 +63,15 @@ export function groupIsComplete(jobs, terminalStatuses) {
 // Thresholds are illustrative starting points, not researched constants --
 // exactly the kind of parameter the master brief's own scheduling research
 // direction exists to tune with real data, not something to treat as
-// settled because a number appears here.
-const NEW_PROVIDER_JOB_THRESHOLD = 5;     // fewer completed jobs than this = unproven
-const LOW_RELIABILITY_THRESHOLD = 0.9;    // below this = "suspicious" per the master brief
-const HIGH_VALUE_PAISE_THRESHOLD = 10_000; // >= ₹100 quoted = worth the extra scrutiny
+// settled because a number appears here. Exported (rather than kept as
+// private consts) specifically so scripts/scheduler_simulation.js can sweep
+// them against simulated outcomes using this SAME decision function, not a
+// second copy of its logic that could drift from what actually ships.
+export const DEFAULT_VERIFICATION_THRESHOLDS = {
+  newProviderJobThreshold: 5,     // fewer completed jobs than this = unproven
+  lowReliabilityThreshold: 0.9,   // below this = "suspicious" per the master brief
+  highValuePaiseThreshold: 10_000, // >= ₹100 quoted = worth the extra scrutiny
+};
 
 // --- third-node fault attribution -----------------------------------------
 //
@@ -116,10 +121,18 @@ export function attributeFaultFromTiebreaker([jobA, jobB], tiebreakerJob) {
  * reliability, or a high-value booking, matching the master brief's own
  * "new providers, suspicious providers, high-value jobs" criteria. Returns a
  * boolean plus the specific reason(s), so a UI can say WHY rather than just
- * showing an unexplained badge. */
-export function shouldRecommendVerification({ repJobsTotal, reliability }, quotedPaise) {
+ * showing an unexplained badge.
+ *
+ * `thresholds` defaults to DEFAULT_VERIFICATION_THRESHOLDS -- every real
+ * call site (scheduler.js) uses the default and should keep doing so; the
+ * override exists for scripts/scheduler_simulation.js to sweep candidate
+ * threshold values against simulated data without forking this logic. */
+export function shouldRecommendVerification(
+  { repJobsTotal, reliability }, quotedPaise, thresholds = DEFAULT_VERIFICATION_THRESHOLDS,
+) {
+  const { newProviderJobThreshold, lowReliabilityThreshold, highValuePaiseThreshold } = thresholds;
   const reasons = [];
-  const isNew = (repJobsTotal ?? 0) < NEW_PROVIDER_JOB_THRESHOLD;
+  const isNew = (repJobsTotal ?? 0) < newProviderJobThreshold;
   if (isNew) reasons.push('new_provider');
   // Only evaluated for a provider with an actual track record. A brand-new
   // node's reliability is nodeStore.js's neutral DEFAULT (0.8 -- "no
@@ -129,7 +142,7 @@ export function shouldRecommendVerification({ repJobsTotal, reliability }, quote
   // don't know yet" is not the same claim as "we know, and it's bad."
   // Caught live: a freshly enrolled node with zero jobs showed both reasons
   // on the same badge before this guard existed.
-  if (!isNew && (reliability ?? 1) < LOW_RELIABILITY_THRESHOLD) reasons.push('low_reliability');
-  if ((quotedPaise ?? 0) >= HIGH_VALUE_PAISE_THRESHOLD) reasons.push('high_value_job');
+  if (!isNew && (reliability ?? 1) < lowReliabilityThreshold) reasons.push('low_reliability');
+  if ((quotedPaise ?? 0) >= highValuePaiseThreshold) reasons.push('high_value_job');
   return { recommended: reasons.length > 0, reasons };
 }

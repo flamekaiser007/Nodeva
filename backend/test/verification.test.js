@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   computeResultHash, compareJobResults, groupIsComplete, shouldRecommendVerification,
-  attributeFaultFromTiebreaker,
+  attributeFaultFromTiebreaker, DEFAULT_VERIFICATION_THRESHOLDS,
 } from '../src/jobs/verification.js';
 
 test('two identical results hash identically', () => {
@@ -193,4 +193,25 @@ test('missing reliability/repJobsTotal fields do not crash and default sensibly'
   assert.doesNotThrow(() => shouldRecommendVerification({}, 4300));
   const { reasons } = shouldRecommendVerification({}, 100);
   assert.ok(reasons.includes('new_provider'), 'missing repJobsTotal must not be treated as proven');
+});
+
+// --- threshold override (for scripts/scheduler_simulation.js) --------------
+
+test('an explicit thresholds override changes the classification', () => {
+  const looseThresholds = {
+    ...DEFAULT_VERIFICATION_THRESHOLDS,
+    newProviderJobThreshold: 0, // nothing is ever "new" under this
+  };
+  const { reasons } = shouldRecommendVerification(
+    { repJobsTotal: 0, reliability: 1 }, 100, looseThresholds);
+  assert.ok(!reasons.includes('new_provider'),
+    'repJobsTotal=0 must not be flagged new when the threshold itself is 0');
+});
+
+test('omitting thresholds keeps using the exact defaults, not a silently different copy', () => {
+  const withDefaultsExplicit = shouldRecommendVerification(
+    { repJobsTotal: 0, reliability: 1 }, 4300, DEFAULT_VERIFICATION_THRESHOLDS);
+  const withDefaultsImplicit = shouldRecommendVerification(
+    { repJobsTotal: 0, reliability: 1 }, 4300);
+  assert.deepEqual(withDefaultsImplicit, withDefaultsExplicit);
 });
