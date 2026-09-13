@@ -173,10 +173,35 @@ Phase 1, early. What exists and is tested:
   worker apply a commit locally, forced the platform's row to `expired` to
   simulate the lost ack) and watched the sweep detect it, release the node's
   hold over the real socket, and free the slot for a genuine rebooking.
+- `backend/src/auth/passwordReset.js` + `backend/src/auth/email.js` +
+  `POST /auth/forgot-password` / `POST /auth/reset-password` — account
+  recovery, closing the gap named in every earlier revision of this list.
+  A raw, high-entropy token goes in the emailed link; only its SHA-256 hash
+  is stored (same reasoning as bcrypt for passwords, applied to a bearer
+  secret), single-use, expires in one hour, and requesting a new one
+  invalidates any earlier unused one. `forgot-password` always returns the
+  identical generic response whether the email is registered or not -- the
+  same email-enumeration defense as login's timing-safe compare, applied to
+  the response body instead of response time. Unlike the Razorpay
+  integration, email delivery here is **genuinely verified end to end, not
+  just implemented against a spec**: `nodemailer`'s Ethereal test accounts
+  are provisioned live via a public API with no signup or credentials of
+  ours required, and `test/email.test.js` sends a real message over real
+  SMTP and reads it back through Ethereal's own preview API to confirm the
+  token survived delivery byte-for-byte. No SMTP configured (this project's
+  default state, same as no Razorpay keys) falls back to logging the reset
+  link instead of emailing it -- loud and honest, the same posture as
+  `UnconfiguredGateway`. Verified live end to end including the browser:
+  signed up, triggered forgot-password, read the real link from the
+  console-fallback log, opened it in the actual frontend (proving Vite's
+  SPA fallback serves `index.html` for the extra `/reset-password` path
+  this app recognizes with no router), submitted a new password through
+  the real form, and confirmed via the API that the old password now
+  fails and the new one works.
 
-Not built yet: account recovery (forgot-password, email verification), P2P
-discovery beyond one platform-worker link, and protecting users from
-malicious providers (no result verification / duplicate execution yet).
+Not built yet: P2P discovery beyond one platform-worker link, and
+protecting users from malicious providers (no result verification /
+duplicate execution yet).
 
 ## Running
 
@@ -187,17 +212,20 @@ for f in backend/migrations/*.sql; do
   docker compose exec -T postgres psql -U nodeva -d nodeva < "$f"
 done
 
-# backend tests (120) -- JWT_SECRET only needed by tests that build the full
+# backend tests (140) -- JWT_SECRET only needed by tests that build the full
 # app (server.js); the unit test files don't call createApp() so most pass
 # without it, but set it anyway to be safe. Several suites (reconciler,
-# reputation-integration, dashboard, payment-flow) additionally need a
-# reachable Postgres (docker compose up -d postgres) and skip cleanly if
-# there isn't one. RAZORPAY_KEY_ID/SECRET are deliberately left UNSET here --
-# see docs/payment-architecture.md for why, and what runs instead.
+# reputation-integration, dashboard, payment-flow, account-recovery)
+# additionally need a reachable Postgres (docker compose up -d postgres) and
+# skip cleanly if there isn't one. email.test.js needs network access to
+# ethereal.email (a live call, no credentials of ours) and skips cleanly
+# without it. RAZORPAY_KEY_ID/SECRET and SMTP_HOST/PORT/USER/PASS are
+# deliberately left UNSET here -- see docs/payment-architecture.md and
+# src/auth/email.js for why, and what runs instead of a real send.
 export JWT_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
 cd backend && node --test test/*.test.js
 
-# worker tests (20)
+# worker tests (41)
 python3 -m venv .venv && .venv/bin/pip install -r worker/requirements-dev.txt
 .venv/bin/pip install websockets
 .venv/bin/python -m pytest worker/tests -q

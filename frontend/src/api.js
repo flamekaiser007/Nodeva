@@ -35,6 +35,14 @@ export const api = {
   login: (email, password) =>
     request('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
 
+  // Always resolves with the same generic message whether the email exists
+  // or not -- the backend deliberately never reveals which, see server.js.
+  forgotPassword: (email) =>
+    request('/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email }) }),
+
+  resetPassword: (token, new_password) =>
+    request('/auth/reset-password', { method: 'POST', body: JSON.stringify({ token, new_password }) }),
+
   // --- marketplace --------------------------------------------------------
   search: (requirements) =>
     request('/search', { method: 'POST', body: JSON.stringify(requirements) }),

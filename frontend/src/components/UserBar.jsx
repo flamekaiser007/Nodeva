@@ -5,17 +5,23 @@ import { api } from '../api'
 // hashing and JWT issuance happen server-side; this component only ever
 // sees the token back, never touches a password hash.
 export default function UserBar({ user, onAuth }) {
-  const [mode, setMode] = useState('login') // 'login' | 'signup'
+  const [mode, setMode] = useState('login') // 'login' | 'signup' | 'forgot'
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [name, setName] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+  const [notice, setNotice] = useState(null) // e.g. "check your email" -- not an error
 
   async function submit(e) {
     e.preventDefault()
-    setBusy(true); setError(null)
+    setBusy(true); setError(null); setNotice(null)
     try {
+      if (mode === 'forgot') {
+        const { message } = await api.forgotPassword(email)
+        setNotice(message)
+        return
+      }
       const result = mode === 'signup'
         ? await api.signup(email, password, name)
         : await api.login(email, password)
@@ -46,11 +52,11 @@ export default function UserBar({ user, onAuth }) {
   return (
     <form onSubmit={submit} className="flex flex-wrap items-center gap-2 border-b border-neutral-200 bg-neutral-50 px-4 py-3 text-sm">
       <div className="mr-2 flex overflow-hidden rounded border border-neutral-300">
-        <button type="button" onClick={() => setMode('login')}
+        <button type="button" onClick={() => { setMode('login'); setNotice(null) }}
           className={`px-2 py-1 ${mode === 'login' ? 'bg-neutral-800 text-white' : 'bg-white text-neutral-600'}`}>
           Log in
         </button>
-        <button type="button" onClick={() => setMode('signup')}
+        <button type="button" onClick={() => { setMode('signup'); setNotice(null) }}
           className={`px-2 py-1 ${mode === 'signup' ? 'bg-neutral-800 text-white' : 'bg-white text-neutral-600'}`}>
           Sign up
         </button>
@@ -63,14 +69,29 @@ export default function UserBar({ user, onAuth }) {
           onChange={(e) => setName(e.target.value)}
           className="rounded border border-neutral-300 px-2 py-1" />
       )}
-      <input required type="password" placeholder="password" value={password}
-        minLength={mode === 'signup' ? 8 : undefined}
-        onChange={(e) => setPassword(e.target.value)}
-        className="rounded border border-neutral-300 px-2 py-1" />
+      {mode !== 'forgot' && (
+        <input required type="password" placeholder="password" value={password}
+          minLength={mode === 'signup' ? 8 : undefined}
+          onChange={(e) => setPassword(e.target.value)}
+          className="rounded border border-neutral-300 px-2 py-1" />
+      )}
       <button disabled={busy} className="rounded bg-neutral-800 px-3 py-1 text-white disabled:opacity-50">
-        {busy ? 'Please wait…' : mode === 'signup' ? 'Create account' : 'Log in'}
+        {busy ? 'Please wait…' : mode === 'signup' ? 'Create account' : mode === 'forgot' ? 'Send reset link' : 'Log in'}
       </button>
+      {mode === 'login' && (
+        <button type="button" onClick={() => { setMode('forgot'); setError(null); setNotice(null) }}
+          className="text-xs text-neutral-500 underline hover:text-neutral-800">
+          Forgot password?
+        </button>
+      )}
+      {mode === 'forgot' && (
+        <button type="button" onClick={() => { setMode('login'); setNotice(null) }}
+          className="text-xs text-neutral-500 underline hover:text-neutral-800">
+          back to log in
+        </button>
+      )}
       {error && <span className="text-red-600">{error}</span>}
+      {notice && <span className="text-emerald-700">{notice}</span>}
     </form>
   )
 }

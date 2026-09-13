@@ -1,10 +1,9 @@
 // HTTP + WebSocket server.
 //
 // SCOPE NOTE: this wires the reservation/payment core loop end to end --
-// signup/login, enroll a node, search, book, confirm, complete a job,
-// settle. Account recovery (forgot-password flows, email verification) is
-// still not built; that gap is now the honest remainder, not the whole of
-// auth. See src/auth/ for password hashing and session issuance.
+// signup/login, account recovery, enroll a node, search, book, confirm,
+// complete a job, settle. See src/auth/ for password hashing, session
+// issuance, and password reset.
 
 import express from 'express';
 import cors from 'cors';
@@ -21,6 +20,8 @@ import { reputationEffect } from '../providers/reputation.js';
 import { hashPassword, verifyPassword } from '../auth/password.js';
 import { requireJwtSecret, signSession } from '../auth/jwt.js';
 import { requireAuth } from '../auth/middleware.js';
+import { generateResetToken, hashResetToken } from '../auth/passwordReset.js';
+import { createEmailSenderFromEnv, resetPasswordEmailBody } from '../auth/email.js';
 import {
   createGatewayFromEnv, verifyPaymentSignature, verifyWebhookSignature,
 } from '../payments/razorpay.js';
@@ -34,7 +35,7 @@ import { issueRefund } from '../payments/refunds.js';
 const DUMMY_HASH_FOR_TIMING_SAFETY =
   '$2b$12$S166KyDHkghng0qE2TtfReFNZp3CAGlX/iFL1s1XgwlQrPyOrKtZi';
 
-export function createApp(pool, { paymentGateway } = {}) {
+export function createApp(pool, { paymentGateway, emailSender } = {}) {
   const app = express();
   const jwtSecret = requireJwtSecret();
   const auth = requireAuth(jwtSecret);
@@ -45,6 +46,16 @@ export function createApp(pool, { paymentGateway } = {}) {
   // `gateway` variable used elsewhere for the internal 'gateway_clearing'
   // LEDGER ACCOUNT -- same word, two different things, kept apart on purpose.
   const razorpay = paymentGateway ?? createGatewayFromEnv();
+  // Same injectable/env-default pattern; falls back to ConsoleEmailSender
+  // (logs the reset link instead of emailing it) when no SMTP is configured.
+  // Named `mailer`, not `email` -- the forgot-password handler below also
+  // destructures `email` from the request body, and shadowing this sender
+  // instance with that string was a real bug caught before it shipped:
+  // email.send(...) would have called .send() on a plain string address.
+  const mailer = emailSender ?? createEmailSenderFromEnv();
+  // Where a password-reset link should point. Defaults to the Vite dev
+  // server's own origin so the flow works out of the box in local dev.
+  const frontendUrl = process.env.FRONTEND_URL ?? 'http://localhost:5173';
   // Dev-permissive CORS: the frontend runs on a different origin (Vite's
   // dev server). Not something to carry into a real deployment unchanged --
   // production should allow-list the actual frontend origin, not '*'.
@@ -183,6 +194,69 @@ export function createApp(pool, { paymentGateway } = {}) {
       res.json({
         token, user: { id: user.user_id, email: user.email, display_name: user.display_name },
       });
+    } catch (e) { next(e); }
+  });
+
+  // Always the same generic response whether the email exists or not --
+  // the SAME email-enumeration reasoning as login's timing-safe compare,
+  // applied to the response body instead of response time. A password-reset
+  // endpoint that says "no account with that email" is a very convenient
+  // oracle for finding out who has an account here.
+  app.post('/auth/forgot-password', async (req, res, next) => {
+    const GENERIC_RESPONSE = { message: 'If an account exists for that email, a reset link has been sent.' };
+    try {
+      const { email } = req.body;
+      const { rows } = await pool.query('SELECT user_id FROM users WHERE email = $1', [email ?? '']);
+      const user = rows[0];
+      if (user) {
+        const { token, tokenHash, expiresAt } = generateResetToken();
+        // Invalidate any earlier outstanding token for this user first --
+        // only the most recently requested reset link should ever work, so
+        // an old email sitting in an inbox (or a mail server's logs) cannot
+        // be used after the user has already asked for a newer one.
+        await pool.query(
+          "UPDATE password_reset_tokens SET used_at = now() WHERE user_id = $1 AND used_at IS NULL",
+          [user.user_id]);
+        await pool.query(
+          `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1,$2,$3)`,
+          [user.user_id, tokenHash, expiresAt]);
+        const resetUrl = `${frontendUrl}/reset-password?token=${token}`;
+        await mailer.send({
+          to: email,
+          subject: 'Reset your NODEVA password', text: resetPasswordEmailBody(resetUrl),
+        }).catch((e) => console.error('failed to send password reset email:', e));
+      }
+      res.json(GENERIC_RESPONSE);
+    } catch (e) { next(e); }
+  });
+
+  app.post('/auth/reset-password', async (req, res, next) => {
+    try {
+      const { token, new_password } = req.body;
+      if (!token || !new_password) {
+        return res.status(400).json({ error: 'token and new_password are required' });
+      }
+      const tokenHash = hashResetToken(token);
+      const { rows } = await pool.query(
+        `SELECT * FROM password_reset_tokens
+          WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()`,
+        [tokenHash]);
+      const resetRow = rows[0];
+      // One generic error for "no such token", "already used", and
+      // "expired" -- same reasoning as everywhere else in this file:
+      // distinguishing them tells a prober which guesses are close.
+      if (!resetRow) return res.status(400).json({ error: 'invalid_or_expired_token' });
+
+      let hash;
+      try {
+        hash = await hashPassword(new_password);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
+
+      await pool.query('UPDATE users SET password_hash = $1 WHERE user_id = $2', [hash, resetRow.user_id]);
+      await pool.query('UPDATE password_reset_tokens SET used_at = now() WHERE token_id = $1', [resetRow.token_id]);
+      res.json({ message: 'password updated' });
     } catch (e) { next(e); }
   });
 

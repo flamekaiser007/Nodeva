@@ -5,8 +5,15 @@ import SearchForm from './components/SearchForm'
 import ResultsList from './components/ResultsList'
 import ActiveReservation from './components/ActiveReservation'
 import ProviderDashboard from './components/ProviderDashboard'
+import ResetPassword from './components/ResetPassword'
 
 const STORAGE_KEY = 'nodeva_session' // { token, user }
+
+// No client-side router in this app -- one extra path is not worth pulling
+// one in. The backend builds reset links as `${frontendUrl}/reset-password
+// ?token=...` (see server.js), so this is the one other "page" the app
+// needs to recognize, checked once at load.
+const RESET_PASSWORD_PATH = '/reset-password'
 
 export default function App() {
   const [session, setSession] = useState(() => {
@@ -16,6 +23,10 @@ export default function App() {
       return saved
     } catch { return null }
   })
+  const [resetToken] = useState(() =>
+    window.location.pathname === RESET_PASSWORD_PATH
+      ? new URLSearchParams(window.location.search).get('token')
+      : undefined) // undefined = not on the reset-password path at all; null/string = on it, with or without a token
   // One account, two roles (master design: "a user can potentially also
   // become a provider") -- this is a view toggle, not a different login.
   const [mode, setMode] = useState('rent') // 'rent' | 'share'
@@ -25,6 +36,18 @@ export default function App() {
   const [reservingId, setReservingId] = useState(null)
   const [reservation, setReservation] = useState(null)
   const [error, setError] = useState(null)
+
+  // Short-circuits the whole normal app -- someone landing here clicked a
+  // password-reset link and is not expected to be signed in or mid-booking.
+  // Placed after every hook above so the branch it skips never has a hook
+  // of its own to worry about ordering with.
+  if (resetToken !== undefined) {
+    return (
+      <div className="min-h-screen bg-neutral-100 p-4">
+        <ResetPassword token={resetToken} onDone={() => { window.location.href = '/' }} />
+      </div>
+    )
+  }
 
   function handleAuth(token, user) {
     setToken(token)
