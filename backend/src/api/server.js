@@ -38,6 +38,38 @@ export function createApp(pool) {
       pool.query('UPDATE compute_nodes SET last_seen_at = now() WHERE node_id = $1',
         [nodeId]).catch(() => {});
     },
+    // Arrives asynchronously, any time after JOB_ACCEPTED -- possibly hours
+    // later for a real workload. Maps the executor's outcome to a reservation
+    // settlement outcome and runs real money through settleReservation, the
+    // same function the manual /complete endpoint uses.
+    onJobResult: async (nodeId, msg) => {
+      try {
+        const { rows } = await pool.query(
+          `UPDATE jobs SET status=$2, exit_code=$3, compute_seconds=$4, completed_at=now()
+             WHERE job_id=$1 RETURNING reservation_id`,
+          [msg.job_id, mapJobStatus(msg.status), msg.exit_code,
+           Math.round(msg.duration_seconds ?? 0)]);
+        const reservationId = rows[0]?.reservation_id;
+        if (!reservationId) {
+          console.error(`JOB_RESULT for unknown job ${msg.job_id}`);
+          return;
+        }
+        const outcome = jobStatusToSettlement(msg.status);
+        const result = await settleReservation(pool, reservationId, outcome, Math.round(msg.duration_seconds ?? 0));
+        // settleReservation reports problems by RETURNING an {error} object,
+        // not by throwing -- the catch block below does not see these. This
+        // is exactly the shape of bug that left a reservation stuck at
+        // 'confirmed' forever with no log line the first time this ran.
+        if (result.error) {
+          console.error(`settlement failed for reservation ${reservationId} (job ${msg.job_id}): ${result.error}`);
+        }
+      } catch (e) {
+        // Money must not silently fail to settle. This is exactly the class
+        // of drift docs/reservation-protocol.md's reconciler exists for; for
+        // now, loud logging is the safety net until that reconciler exists.
+        console.error(`failed to settle reservation for job ${msg.job_id} from node ${nodeId}:`, e);
+      }
+    },
   });
 
   // --- dev-only seeding, see SCOPE NOTE above -------------------------------
@@ -232,70 +264,69 @@ export function createApp(pool) {
     }
   });
 
-  // Job completion + settlement. Job execution itself (Docker, sandboxing)
-  // is not built yet — this endpoint accepts the OUTCOME a worker would report
-  // and runs the money side of it, so the settlement math is exercised for
-  // real rather than only in unit tests.
+  // Job completion + settlement, shared by the manual endpoint below and
+  // by onJobResult once a real job actually finishes -- one settlement path,
+  // not two copies that could drift apart.
   app.post('/reservations/:id/complete', async (req, res, next) => {
-    const { outcome, compute_seconds } = req.body; // 'completed' | 'failed_user' | 'failed_provider'
-    const client = await pool.connect();
     try {
-      const { rows } = await client.query(
-        'SELECT * FROM reservations WHERE reservation_id = $1 FOR UPDATE', [req.params.id]);
+      const result = await settleReservation(
+        pool, req.params.id, req.body.outcome, req.body.compute_seconds);
+      if (result.error) return res.status(result.status).json({ error: result.error });
+      res.json(result);
+    } catch (e) { next(e); }
+  });
+
+  // --- jobs ------------------------------------------------------------
+
+  // Submit a job against a CONFIRMED reservation. Resolves once the node has
+  // started the container -- not when the job finishes, which may be hours
+  // later and arrives asynchronously via onJobResult below.
+  app.post('/reservations/:id/jobs', async (req, res, next) => {
+    try {
+      const { rows } = await pool.query(
+        'SELECT * FROM reservations WHERE reservation_id = $1', [req.params.id]);
       const resv = rows[0];
       if (!resv) return res.status(404).json({ error: 'not_found' });
-      if (!SETTLEMENT[outcome]) return res.status(400).json({ error: 'unknown_outcome' });
-
-      await client.query('BEGIN');
-      const escrow = await accountId(client, 'user_escrow', resv.user_id, null);
-      const providerRow = await client.query(
-        'SELECT provider_id FROM compute_nodes WHERE node_id = $1', [resv.node_id]);
-      const providerId = providerRow.rows[0].provider_id;
-      const providerAcct = await accountId(client, 'provider_balance', null, providerId);
-      const platformAcct = await accountId(client, 'platform_revenue', null, null);
-      const refundsAcct = await accountId(client, 'refunds', null, null);
-
-      const rule = SETTLEMENT[outcome];
-      let chargePaise = 0;
-      if (rule === 'settle_full') chargePaise = resv.quoted_paise;
-      else if (rule === 'settle_metered') {
-        chargePaise = meteredCharge(resv.quoted_paise, resv.price_paise_hr, compute_seconds ?? 0);
-      } // refund_full and refund_per_policy leave chargePaise at 0
-
-      const txn = await client.query(
-        `INSERT INTO ledger_transactions (kind, reservation_id, idempotency_key)
-         VALUES ('settle', $1, $2) RETURNING txn_id`,
-        [resv.reservation_id, `settle-${resv.reservation_id}`]);
-      const txnId = txn.rows[0].txn_id;
-
-      const entries = [[escrow, -resv.quoted_paise]];
-      if (chargePaise > 0) {
-        const { provider, platform } = split(chargePaise);
-        entries.push([providerAcct, provider], [platformAcct, platform]);
-      }
-      const refund = resv.quoted_paise - chargePaise;
-      if (refund > 0) entries.push([refundsAcct, refund]);
-
-      for (const [acct, amt] of entries) {
-        await client.query(
-          'INSERT INTO ledger_entries (txn_id, account_id, amount_paise) VALUES ($1,$2,$3)',
-          [txnId, acct, amt]);
+      if (resv.status !== S.CONFIRMED) {
+        return res.status(409).json({ error: `reservation is ${resv.status}, not confirmed` });
       }
 
-      await client.query(
-        'UPDATE reservations SET status=$2, updated_at=now() WHERE reservation_id=$1',
-        [resv.reservation_id, outcome]);
-      await client.query('COMMIT');
+      const jobId = crypto.randomUUID();
+      const { image, command, env, timeout_seconds, gpu } = req.body;
 
-      res.json({ reservation_id: resv.reservation_id, status: outcome,
-                 charged_paise: chargePaise, refunded_paise: refund });
-    } catch (e) {
-      await client.query('ROLLBACK').catch(() => {});
-      if (e.code === '23505') return res.status(409).json({ error: 'already_settled' });
-      next(e);
-    } finally {
-      client.release();
-    }
+      try {
+        await hub.submitJob(resv.node_id, {
+          jobId, reservationId: resv.reservation_id, image, command, env, gpu,
+        });
+      } catch (e) {
+        if (e instanceof NodeOffline) return res.status(409).json({ error: 'node_offline' });
+        if (e instanceof NodeRefused) return res.status(409).json({ error: e.reason });
+        if (e instanceof NodeTimeout) return res.status(504).json({ error: 'node_unresponsive' });
+        throw e;
+      }
+
+      await pool.query(
+        `INSERT INTO jobs (job_id, reservation_id, image, command, status, started_at)
+         VALUES ($1,$2,$3,$4,'running',now())`,
+        [jobId, resv.reservation_id, image, command]);
+      // The reservation lifecycle requires confirmed -> running -> completed
+      // (see reservations/machine.js); settleReservation later transitions
+      // FROM 'running', so skipping this step leaves it stuck at 'confirmed'
+      // forever once the job finishes -- caught by the e2e script.
+      await pool.query(
+        "UPDATE reservations SET status='running', updated_at=now() WHERE reservation_id=$1",
+        [resv.reservation_id]);
+
+      res.status(202).json({ job_id: jobId, status: 'running' });
+    } catch (e) { next(e); }
+  });
+
+  app.get('/jobs/:id', async (req, res, next) => {
+    try {
+      const { rows } = await pool.query('SELECT * FROM jobs WHERE job_id = $1', [req.params.id]);
+      if (!rows[0]) return res.status(404).json({ error: 'not_found' });
+      res.json(rows[0]);
+    } catch (e) { next(e); }
   });
 
   app.get('/health', (req, res) => res.json({ ok: true }));
@@ -306,6 +337,116 @@ export function createApp(pool) {
   });
 
   return { app, hub };
+}
+
+// executor.py's JobResult.status vocabulary -> jobs.status (schema-constrained).
+function mapJobStatus(execStatus) {
+  return {
+    succeeded: 'succeeded',
+    failed: 'failed_user',
+    // A job that hit its own wall-clock timeout or was OOM-killed consumed
+    // the resources it was given; that is the user's workload misbehaving,
+    // not the provider's. Bill it, don't refund it.
+    timed_out: 'failed_user',
+    oom_killed: 'failed_user',
+    // `error` means the EXECUTOR could not run the job at all -- docker
+    // unavailable, or similar infrastructure failure on the node's side.
+    // Simplification worth flagging: a job that fails because the user gave
+    // a nonexistent image also surfaces as `error` today (docker run itself
+    // fails), and gets refunded as if it were the provider's fault. That is
+    // generous to the user rather than dangerous, so it is left as a known
+    // gap rather than solved here -- distinguishing "bad image" from "no
+    // docker" needs the executor to parse docker's stderr, which is not
+    // done yet.
+    error: 'failed_provider',
+  }[execStatus] ?? 'failed_provider';
+}
+
+// A DIFFERENT vocabulary from mapJobStatus above, despite the overlap --
+// jobs.status uses 'succeeded', but reservations.status (and SETTLEMENT's
+// keys) use 'completed'. Conflating these two by reusing one function was a
+// real bug caught by the e2e script: the job row updated correctly but
+// settleReservation was then called with outcome='succeeded', which
+// SETTLEMENT has no entry for, so canTransition/SETTLEMENT lookups silently
+// no-op'd and the reservation was left stuck at 'confirmed' forever.
+function jobStatusToSettlement(execStatus) {
+  return {
+    succeeded: 'completed',
+    failed: 'failed_user',
+    timed_out: 'failed_user',
+    oom_killed: 'failed_user',
+    error: 'failed_provider',
+  }[execStatus] ?? 'failed_provider';
+}
+
+// Settlement, usable both from the manual /complete route and from
+// onJobResult once a real job finishes. Returns a plain result object rather
+// than writing to `res` directly, so callers that are not HTTP handlers (the
+// hub's job-result callback) can use it identically.
+async function settleReservation(pool, reservationId, outcome, computeSeconds) {
+  const client = await pool.connect();
+  try {
+    const { rows } = await client.query(
+      'SELECT * FROM reservations WHERE reservation_id = $1 FOR UPDATE', [reservationId]);
+    const resv = rows[0];
+    if (!resv) return { error: 'not_found', status: 404 };
+    if (!SETTLEMENT[outcome]) return { error: 'unknown_outcome', status: 400 };
+    if (!canTransition(resv.status, outcome)) {
+      // Most commonly: already settled. Idempotency-key uniqueness below is
+      // the hard guarantee; this is a friendlier early exit for the common case.
+      return { error: `cannot settle from ${resv.status}`, status: 409 };
+    }
+
+    await client.query('BEGIN');
+    const escrow = await accountId(client, 'user_escrow', resv.user_id, null);
+    const providerRow = await client.query(
+      'SELECT provider_id FROM compute_nodes WHERE node_id = $1', [resv.node_id]);
+    const providerId = providerRow.rows[0].provider_id;
+    const providerAcct = await accountId(client, 'provider_balance', null, providerId);
+    const platformAcct = await accountId(client, 'platform_revenue', null, null);
+    const refundsAcct = await accountId(client, 'refunds', null, null);
+
+    const rule = SETTLEMENT[outcome];
+    let chargePaise = 0;
+    if (rule === 'settle_full') chargePaise = resv.quoted_paise;
+    else if (rule === 'settle_metered') {
+      chargePaise = meteredCharge(resv.quoted_paise, resv.price_paise_hr, computeSeconds ?? 0);
+    } // refund_full and refund_per_policy leave chargePaise at 0
+
+    const txn = await client.query(
+      `INSERT INTO ledger_transactions (kind, reservation_id, idempotency_key)
+       VALUES ('settle', $1, $2) RETURNING txn_id`,
+      [resv.reservation_id, `settle-${resv.reservation_id}`]);
+    const txnId = txn.rows[0].txn_id;
+
+    const entries = [[escrow, -resv.quoted_paise]];
+    if (chargePaise > 0) {
+      const { provider, platform } = split(chargePaise);
+      entries.push([providerAcct, provider], [platformAcct, platform]);
+    }
+    const refund = resv.quoted_paise - chargePaise;
+    if (refund > 0) entries.push([refundsAcct, refund]);
+
+    for (const [acct, amt] of entries) {
+      await client.query(
+        'INSERT INTO ledger_entries (txn_id, account_id, amount_paise) VALUES ($1,$2,$3)',
+        [txnId, acct, amt]);
+    }
+
+    await client.query(
+      'UPDATE reservations SET status=$2, updated_at=now() WHERE reservation_id=$1',
+      [resv.reservation_id, outcome]);
+    await client.query('COMMIT');
+
+    return { reservation_id: resv.reservation_id, status: outcome,
+             charged_paise: chargePaise, refunded_paise: refund };
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (e.code === '23505') return { error: 'already_settled', status: 409 };
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 async function accountId(client, kind, ownerUserId, ownerProviderId) {

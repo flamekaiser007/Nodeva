@@ -14,8 +14,9 @@ import time
 import websockets
 
 from .canonical import encode
+from .executor import JobSpec, run_job, DockerUnavailable
 from .hardware import detect_gpus, offerable_vram_mb, NoGpu
-from .reservations import ReservationStore, SlotUnavailable
+from .reservations import ReservationStore, SlotUnavailable, CONFIRMED, RUNNING
 
 log = logging.getLogger("nodeva.worker.link")
 
@@ -104,6 +105,7 @@ class WorkerLink:
             handler = {
                 "RESERVE_REQUEST": self._on_reserve_request,
                 "RESERVE_COMMIT": self._on_reserve_commit,
+                "JOB_SUBMIT": self._on_job_submit,
             }.get(msg["type"])
             if handler is None:
                 log.warning("unhandled message type %s", msg["type"])
@@ -143,3 +145,62 @@ class WorkerLink:
             **({} if ok else {"reason": "hold_expired_or_unknown"}),
         }))
         log.info("commit %s for %s", "accepted" if ok else "REJECTED", rid)
+
+    async def _on_job_submit(self, ws, msg):
+        job_id = msg["job_id"]
+        rid = msg["reservation_id"]
+
+        # Refuse to run anything against a reservation this node has not
+        # itself confirmed as paid -- the local reservation ledger is the
+        # authority here too, exactly as it is for booking. A platform bug
+        # (or a compromised platform) asking us to run a job for a
+        # reservation we never confirmed must not be honoured just because
+        # it arrived over an authenticated connection.
+        status = self.store.status_of(rid)
+        if status not in (CONFIRMED, RUNNING):
+            await ws.send(json.dumps({
+                "type": "JOB_REJECTED", "job_id": job_id,
+                "reason": f"reservation not confirmed locally (status={status})",
+            }))
+            log.warning("rejected job %s: reservation %s status=%s", job_id, rid, status)
+            return
+
+        await ws.send(json.dumps({"type": "JOB_ACCEPTED", "job_id": job_id}))
+        log.info("accepted job %s for reservation %s", job_id, rid)
+
+        # Run in a worker thread: run_job() blocks on real wall-clock time
+        # waiting for the container, potentially for hours, and must not
+        # stall the heartbeat loop on this same event loop.
+        asyncio.create_task(self._run_and_report(ws, job_id, msg))
+
+    async def _run_and_report(self, ws, job_id, msg):
+        spec = JobSpec(
+            image=msg["image"],
+            command=msg["command"],
+            timeout_seconds=msg.get("timeout_seconds", 3600),
+            env=msg.get("env") or {},
+            gpu_device_ids=msg.get("gpu") or [],
+        )
+        try:
+            result = await asyncio.to_thread(run_job, spec)
+            payload = {
+                "type": "JOB_RESULT", "job_id": job_id,
+                "status": result.status, "exit_code": result.exit_code,
+                "stdout": result.stdout, "stderr": result.stderr,
+                "duration_seconds": result.duration_seconds,
+            }
+        except DockerUnavailable as e:
+            payload = {
+                "type": "JOB_RESULT", "job_id": job_id,
+                "status": "error", "exit_code": None,
+                "stdout": "", "stderr": str(e), "duration_seconds": 0,
+            }
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception:
+            # Connection dropped mid-job. The platform's own reconciliation
+            # (heartbeat/offline detection) is what recovers from this, not
+            # a retry here -- by the time we could retry, a fresh connection
+            # would need re-authentication anyway.
+            log.exception("failed to report result for job %s; connection likely dropped", job_id)
+        log.info("job %s finished: %s", job_id, payload["status"])

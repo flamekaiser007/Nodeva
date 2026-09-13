@@ -22,6 +22,9 @@ export const TYPE = {
   DENY: 'DENY',                         // { reservation_id, reason }
   COMMITTED: 'COMMITTED',               // { reservation_id }
   COMMIT_FAILED: 'COMMIT_FAILED',       // { reservation_id, reason }
+  JOB_ACCEPTED: 'JOB_ACCEPTED',         // { job_id } -- node started the container
+  JOB_REJECTED: 'JOB_REJECTED',         // { job_id, reason } -- e.g. reservation not confirmed locally
+  JOB_RESULT: 'JOB_RESULT',             // { job_id, status, exit_code, stdout, stderr, duration_seconds } -- unsolicited, sent whenever the job finishes
 
   // backend -> worker
   CHALLENGE: 'CHALLENGE',               // { nonce }
@@ -29,6 +32,7 @@ export const TYPE = {
   REJECT: 'REJECT',                     // { reason }
   RESERVE_REQUEST: 'RESERVE_REQUEST',   // { reservation_id, starts_at, ends_at, price_paise_hr }
   RESERVE_COMMIT: 'RESERVE_COMMIT',     // { reservation_id }
+  JOB_SUBMIT: 'JOB_SUBMIT',             // { job_id, reservation_id, image, command, env, gpu }
   ERROR: 'ERROR',                       // { message }
 };
 
@@ -39,6 +43,9 @@ export const AUTH_TIMEOUT_MS = 5_000;
 // really bounding network + scheduling jitter, not disk time.
 export const RESERVE_TIMEOUT_MS = 8_000;
 export const COMMIT_TIMEOUT_MS = 8_000;
+// How long we wait for JOB_ACCEPTED/JOB_REJECTED -- just an ack that the
+// container started, NOT the job's own runtime. JOB_RESULT arrives later,
+// unsolicited, whenever the job actually finishes (which may be hours).
 // A node that misses this many heartbeat intervals is presumed offline. The
 // platform's `online` flag is a cache of this, never the reverse.
 export const HEARTBEAT_INTERVAL_MS = 15_000;

@@ -56,15 +56,24 @@ Phase 1, early. What exists and is tested:
   challenge-response against the node's registered public key, not a bearer
   token — proving possession of the private key on every connection.
 - `backend/src/api/server.js` — HTTP API: enroll a node, search, reserve,
-  confirm (capture into escrow), complete (settle 90/10 or refund).
+  confirm (capture into escrow), submit a job, complete/settle (automatic on
+  job result, or manual for testing).
+- `worker/nodeva_worker/executor.py` — sandboxed Docker execution: read-only
+  root filesystem, no capabilities, no network by default, memory/CPU/pid
+  limits, non-root, wall-clock timeout. Every control is tested against a
+  real container in `worker/tests/test_executor.py`, not just asserted from
+  the flag name. See `docs/security-model.md` for what this does and does
+  NOT protect against -- notably, nothing here protects the user from a
+  malicious provider; that direction is unsolved.
 - `scripts/e2e_demo.sh` — boots a real Postgres, backend, and Python worker
   and drives the full loop over an actual network connection: a live signed
   receipt, a denied double-booking from the running node, an exact ledger
   settlement, and detection of a killed worker process. Not mocked.
 
 Not built yet: user auth (the API has a dev-only user-seeding stub, clearly
-marked, not real signup/login), job execution/sandboxing, frontend, P2P
-discovery beyond one platform-worker link.
+marked, not real signup/login), frontend, P2P discovery beyond one
+platform-worker link, protecting users from malicious providers (no result
+verification / duplicate execution yet).
 
 ## Running
 
@@ -81,7 +90,10 @@ python3 -m venv .venv && .venv/bin/pip install -r worker/requirements-dev.txt
 .venv/bin/pip install websockets
 .venv/bin/python -m pytest worker/tests -q
 
-# full network integration demo (needs docker)
+# executor tests against a real container (needs docker; pulls alpine:3.20 once)
+.venv/bin/python -m pytest worker/tests/test_executor.py -q
+
+# full network integration demo, including a real sandboxed job (needs docker)
 ./scripts/e2e_demo.sh
 ```
 

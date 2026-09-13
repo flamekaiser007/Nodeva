@@ -37,17 +37,23 @@ export class Hub {
    * @param {(nodeId: string, online: boolean) => void} [deps.onPresence]
    */
   constructor({
-    lookupPublicKey, onHeartbeat, onPresence,
+    lookupPublicKey, onHeartbeat, onPresence, onJobResult,
     authTimeoutMs = AUTH_TIMEOUT_MS,
     reserveTimeoutMs = RESERVE_TIMEOUT_MS,
     commitTimeoutMs = COMMIT_TIMEOUT_MS,
+    jobAckTimeoutMs = RESERVE_TIMEOUT_MS,
   } = {}) {
     this._lookupPublicKey = lookupPublicKey;
     this._onHeartbeat = onHeartbeat ?? (() => {});
     this._onPresence = onPresence ?? (() => {});
+    // Unlike RECEIPT/COMMITTED, JOB_RESULT is not a reply to a pending
+    // request with a bounded timeout -- a job can run for hours. It is
+    // routed to a standing callback instead of through `_pending`.
+    this._onJobResult = onJobResult ?? (() => {});
     this._authTimeoutMs = authTimeoutMs;
     this._reserveTimeoutMs = reserveTimeoutMs;
     this._commitTimeoutMs = commitTimeoutMs;
+    this._jobAckTimeoutMs = jobAckTimeoutMs;
     // nodeId -> connection state. One live socket per node; a second HELLO
     // for the same node_id replaces the first (the old one is presumed dead
     // or a stale reconnect race, and we trust the newest proof of possession).
@@ -95,7 +101,11 @@ export class Hub {
       case TYPE.DENY:
       case TYPE.COMMITTED:
       case TYPE.COMMIT_FAILED:
+      case TYPE.JOB_ACCEPTED:
+      case TYPE.JOB_REJECTED:
         return this._resolvePending(msg);
+      case TYPE.JOB_RESULT:
+        return this._onJobResult(state.nodeId, msg);
       default:
         return this._send(socket, { type: TYPE.ERROR, message: `unexpected type ${msg.type}` });
     }
@@ -155,10 +165,11 @@ export class Hub {
   }
 
   _resolvePending(msg) {
-    const p = this._pending.get(msg.reservation_id);
+    const key = msg.reservation_id ?? msg.job_id;
+    const p = this._pending.get(key);
     if (!p) return; // late/duplicate reply after we already timed out or resolved
     clearTimeout(p.timer);
-    this._pending.delete(msg.reservation_id);
+    this._pending.delete(key);
     p.resolve(msg);
   }
 
@@ -175,6 +186,21 @@ export class Hub {
     }).then((msg) => {
       if (msg.type === TYPE.DENY) throw new NodeRefused(msg.reason);
       return msg; // RECEIPT
+    });
+  }
+
+  /** Submit a job for a confirmed reservation. Resolves once the node
+   * acknowledges (container started or rejected) -- NOT when the job
+   * finishes. The eventual outcome arrives later via onJobResult. */
+  submitJob(nodeId, { jobId, reservationId, image, command, env, gpu }) {
+    const conn = this._nodes.get(nodeId);
+    if (!conn) return Promise.reject(new NodeOffline(nodeId));
+    return this._sendAwait(conn.socket, jobId, this._jobAckTimeoutMs, {
+      type: TYPE.JOB_SUBMIT, job_id: jobId, reservation_id: reservationId,
+      image, command, env: env ?? {}, gpu: gpu ?? [],
+    }).then((msg) => {
+      if (msg.type === TYPE.JOB_REJECTED) throw new NodeRefused(msg.reason);
+      return msg; // JOB_ACCEPTED
     });
   }
 

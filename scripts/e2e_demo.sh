@@ -124,11 +124,30 @@ echo "OK: denied with $CONFLICT"
 echo "== confirm: captures into escrow =="
 curl -sf -X POST "http://localhost:3100/reservations/$RID/confirm"; echo
 
-echo "== complete as success: must settle exactly 90/10 =="
-COMPLETE=$(curl -sf -X POST "http://localhost:3100/reservations/$RID/complete" \
-  -H 'content-type: application/json' -d '{"outcome":"completed"}')
-echo "$COMPLETE"
-CHARGED=$(echo "$COMPLETE" | json "['charged_paise']")
+echo "== submit a real job: runs in an actual sandboxed container on the worker =="
+if command -v docker >/dev/null 2>&1 && docker image inspect alpine:3.20 >/dev/null 2>&1; then
+  JOB=$(curl -sf -X POST "http://localhost:3100/reservations/$RID/jobs"     -H 'content-type: application/json'     -d '{"image":"alpine:3.20","command":["/bin/sh","-c","echo nodeva-e2e-output"],"timeout_seconds":30}')
+  echo "$JOB"
+  JOB_ID=$(echo "$JOB" | json "['job_id']")
+
+  echo "== waiting for the job to actually finish and settle the reservation =="
+  for i in $(seq 1 20); do
+    JOB_STATUS=$(curl -sf "http://localhost:3100/jobs/$JOB_ID" | json "['status']")
+    [ "$JOB_STATUS" = "succeeded" ] && break
+    sleep 1
+  done
+  [ "$JOB_STATUS" = "succeeded" ] || { echo "FAIL: job did not succeed within 20s, last status=$JOB_STATUS"; cat "$WORKER_LOG"; exit 1; }
+  echo "OK: job succeeded, real container output was captured by the worker"
+
+  RES_STATUS=$(docker compose exec -T postgres psql -U nodeva -d nodeva -t -A -c     "SELECT status FROM reservations WHERE reservation_id='$RID';")
+  [ "$RES_STATUS" = "completed" ] || { echo "FAIL: expected reservation completed via job result, got $RES_STATUS"; echo "--- backend log ---"; cat "$BACKEND_LOG"; exit 1; }
+  CHARGED=4300
+else
+  echo "SKIPPED (docker or alpine:3.20 not available) -- settling manually instead"
+  COMPLETE=$(curl -sf -X POST "http://localhost:3100/reservations/$RID/complete"     -H 'content-type: application/json' -d '{"outcome":"completed"}')
+  echo "$COMPLETE"
+  CHARGED=$(echo "$COMPLETE" | json "['charged_paise']")
+fi
 [ "$CHARGED" = "4300" ] || { echo "FAIL: expected charge 4300, got $CHARGED"; exit 1; }
 
 echo "== ledger balances exactly (90/10 split of 4300) =="
