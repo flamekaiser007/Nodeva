@@ -19,7 +19,7 @@ import { S, canTransition, SETTLEMENT } from '../reservations/machine.js';
 import { expireStaleHolds } from '../reservations/reconciler.js';
 import { reputationEffect } from '../providers/reputation.js';
 import { hashPassword, verifyPassword } from '../auth/password.js';
-import { requireJwtSecret, signSession } from '../auth/jwt.js';
+import { requireJwtSecret, requireJwtVerificationSecrets, signSession } from '../auth/jwt.js';
 import { requireAuth } from '../auth/middleware.js';
 import { requireAdminToken } from '../auth/adminToken.js';
 import { generateResetToken, hashResetToken } from '../auth/passwordReset.js';
@@ -56,7 +56,10 @@ const DUMMY_HASH_FOR_TIMING_SAFETY =
 export function createApp(pool, { paymentGateway, emailSender } = {}) {
   const app = express();
   const jwtSecret = requireJwtSecret();
-  const auth = requireAuth(jwtSecret);
+  // Signing always uses the single current secret (jwtSecret, above);
+  // verifying accepts it plus JWT_SECRET_PREVIOUS -- see jwt.js's own
+  // comment on why rotation is asymmetric between the two.
+  const auth = requireAuth(requireJwtVerificationSecrets());
 
   // Rate limits for the three auth endpoints exposed to abuse before a
   // session even exists (see auth/rateLimit.js for the honest per-process

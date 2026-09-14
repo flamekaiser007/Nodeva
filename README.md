@@ -825,6 +825,33 @@ Phase 1, early. What exists and is tested:
   being queryable and an application correctly serving requests off it are
   different claims).
 
+- **Secrets rotation for JWT_SECRET and ADMIN_TOKEN.** Before this, either
+  secret was a single env var with no successor: rotating `JWT_SECRET`
+  logged out every existing session the instant a new process started,
+  and rotating `ADMIN_TOKEN` broke Prometheus's scrape (and any dashboard
+  holding the old value) until every holder was updated in the same
+  instant. Adds `JWT_SECRET_PREVIOUS` / `ADMIN_TOKEN_PREVIOUS` --
+  signing always uses the single current secret, but verification accepts
+  the current one plus whatever is listed as previous (comma-separated).
+  Deliberately asymmetric: a new token always moves forward, but
+  verification looks backward for as long as the `_PREVIOUS` variable
+  stays set, so a two-deploy rotation (set both -> wait -> remove the
+  previous one) actually completes instead of rotating forever. See
+  `docs/secrets-rotation.md` for the full runbook, including what this
+  does NOT do (no automated rotation, no leak detection -- both are manual,
+  human-triggered).
+
+  9 new auth.test.js tests (array-of-secrets verification, the
+  requireJwtVerificationSecrets parsing, a full sign-with-old/verify-mid-
+  rotation/sign-with-new round trip) and 5 new adminToken.test.js tests.
+  Backend suite is now 293 tests. Verified live via
+  `scripts/secrets_rotation_demo.sh`: three real, separate backend
+  PROCESSES in sequence (pre-rotation, mid-rotation with both secrets, and
+  post-rotation with the old ones removed) -- a real JWT issued by the
+  FIRST process still authenticates against the THIRD, and the retired
+  secret genuinely stops working once the rotation is declared complete,
+  for both JWT_SECRET and ADMIN_TOKEN.
+
 ## Running
 
 ```bash

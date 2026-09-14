@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { hashPassword, verifyPassword } from '../src/auth/password.js';
-import { signSession, verifySession, requireJwtSecret } from '../src/auth/jwt.js';
+import { signSession, verifySession, requireJwtSecret, requireJwtVerificationSecrets } from '../src/auth/jwt.js';
 import { requireAuth } from '../src/auth/middleware.js';
 
 const SECRET = 'a'.repeat(32);
@@ -72,6 +72,72 @@ test('requireJwtSecret refuses a short/guessable secret', () => {
     assert.throws(() => requireJwtSecret());
   } finally {
     if (saved !== undefined) process.env.JWT_SECRET = saved; else delete process.env.JWT_SECRET;
+  }
+});
+
+// --- secret rotation ---------------------------------------------------
+
+test('verifySession accepts an array and tries each secret in order', () => {
+  const OLD = 'b'.repeat(32);
+  const token = signSession(OLD, { userId: 'u1', email: 'a@b.com' });
+  // The current secret (SECRET) doesn't verify this token, but the
+  // previous one (OLD) in the list does -- this is exactly the mid-
+  // rotation case: a session issued before the rotation must keep working.
+  const { userId } = verifySession([SECRET, OLD], token);
+  assert.equal(userId, 'u1');
+});
+
+test('verifySession still rejects a token that matches none of the candidates', () => {
+  const token = signSession('c'.repeat(32), { userId: 'u1', email: 'a@b.com' });
+  assert.throws(() => verifySession([SECRET, 'b'.repeat(32)], token));
+});
+
+test('requireJwtVerificationSecrets returns just the current secret with no rotation configured', () => {
+  const savedCurrent = process.env.JWT_SECRET;
+  const savedPrevious = process.env.JWT_SECRET_PREVIOUS;
+  process.env.JWT_SECRET = SECRET;
+  delete process.env.JWT_SECRET_PREVIOUS;
+  try {
+    assert.deepEqual(requireJwtVerificationSecrets(), [SECRET]);
+  } finally {
+    if (savedCurrent !== undefined) process.env.JWT_SECRET = savedCurrent; else delete process.env.JWT_SECRET;
+    if (savedPrevious !== undefined) process.env.JWT_SECRET_PREVIOUS = savedPrevious;
+  }
+});
+
+test('requireJwtVerificationSecrets includes JWT_SECRET_PREVIOUS entries, comma-separated', () => {
+  const savedCurrent = process.env.JWT_SECRET;
+  const savedPrevious = process.env.JWT_SECRET_PREVIOUS;
+  const oldA = 'd'.repeat(32);
+  const oldB = 'e'.repeat(32);
+  process.env.JWT_SECRET = SECRET;
+  process.env.JWT_SECRET_PREVIOUS = `${oldA}, ${oldB}`; // whitespace after the comma is trimmed
+  try {
+    assert.deepEqual(requireJwtVerificationSecrets(), [SECRET, oldA, oldB]);
+  } finally {
+    if (savedCurrent !== undefined) process.env.JWT_SECRET = savedCurrent; else delete process.env.JWT_SECRET;
+    if (savedPrevious !== undefined) process.env.JWT_SECRET_PREVIOUS = savedPrevious; else delete process.env.JWT_SECRET_PREVIOUS;
+  }
+});
+
+test('a full rotation round-trip: a pre-rotation token keeps working, a post-rotation token also works', () => {
+  const OLD = 'f'.repeat(32);
+  const NEW = 'g'.repeat(32);
+  const preRotationToken = signSession(OLD, { userId: 'u1', email: 'a@b.com' });
+
+  const savedCurrent = process.env.JWT_SECRET;
+  const savedPrevious = process.env.JWT_SECRET_PREVIOUS;
+  process.env.JWT_SECRET = NEW;
+  process.env.JWT_SECRET_PREVIOUS = OLD;
+  try {
+    const verificationSecrets = requireJwtVerificationSecrets();
+    assert.equal(verifySession(verificationSecrets, preRotationToken).userId, 'u1');
+
+    const postRotationToken = signSession(requireJwtSecret(), { userId: 'u2', email: 'c@d.com' });
+    assert.equal(verifySession(verificationSecrets, postRotationToken).userId, 'u2');
+  } finally {
+    if (savedCurrent !== undefined) process.env.JWT_SECRET = savedCurrent; else delete process.env.JWT_SECRET;
+    if (savedPrevious !== undefined) process.env.JWT_SECRET_PREVIOUS = savedPrevious; else delete process.env.JWT_SECRET_PREVIOUS;
   }
 });
 

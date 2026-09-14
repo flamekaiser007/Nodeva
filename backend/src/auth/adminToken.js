@@ -30,11 +30,22 @@ function extractProvidedToken(req) {
   return match ? match[1] : '';
 }
 
-export function requireAdminToken(req, res, next) {
-  const expected = process.env.ADMIN_TOKEN;
-  if (!expected) return res.status(404).json({ error: 'not_found' });
+// Current token plus any still-valid PREVIOUS ones (ADMIN_TOKEN_PREVIOUS,
+// comma-separated) -- same rotation shape as jwt.js's
+// requireJwtVerificationSecrets, and for the same reason: rotating a
+// shared secret should not require perfectly synchronizing every holder
+// of it (a human's password manager entry, a Prometheus scrape config, a
+// dashboard's saved credential) to change at the exact same instant. See
+// docs/secrets-rotation.md.
+function expectedTokens() {
+  const current = process.env.ADMIN_TOKEN;
+  if (!current) return [];
+  const previous = (process.env.ADMIN_TOKEN_PREVIOUS ?? '')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  return [current, ...previous];
+}
 
-  const provided = extractProvidedToken(req);
+function timingSafeEquals(provided, expected) {
   const expectedBuf = Buffer.from(expected);
   const providedBuf = Buffer.from(provided);
   // timingSafeEqual throws on a length mismatch rather than returning
@@ -43,8 +54,20 @@ export function requireAdminToken(req, res, next) {
   // separately so equal-length garbage still correctly fails.
   const padded = Buffer.alloc(expectedBuf.length);
   providedBuf.copy(padded);
-  const matches = providedBuf.length === expectedBuf.length
-    && crypto.timingSafeEqual(padded, expectedBuf);
+  return providedBuf.length === expectedBuf.length && crypto.timingSafeEqual(padded, expectedBuf);
+}
+
+export function requireAdminToken(req, res, next) {
+  const candidates = expectedTokens();
+  if (candidates.length === 0) return res.status(404).json({ error: 'not_found' });
+
+  const provided = extractProvidedToken(req);
+  // Checks every candidate rather than stopping at the first mismatch --
+  // deliberately NOT short-circuiting on "provided is empty" or similar,
+  // so the number of candidates configured doesn't leak through timing
+  // either. Each individual comparison is still the same timing-safe
+  // check as before.
+  const matches = candidates.some((expected) => timingSafeEquals(provided, expected));
   if (!matches) return res.status(404).json({ error: 'not_found' });
   next();
 }

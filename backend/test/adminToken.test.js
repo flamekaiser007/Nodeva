@@ -12,7 +12,7 @@ function fakeRes() {
   return res;
 }
 
-test.beforeEach(() => { delete process.env.ADMIN_TOKEN; });
+test.beforeEach(() => { delete process.env.ADMIN_TOKEN; delete process.env.ADMIN_TOKEN_PREVIOUS; });
 
 test('disabled (no ADMIN_TOKEN set) 404s regardless of what header is sent', () => {
   const req = fakeReq({ 'x-admin-token': 'anything' });
@@ -102,4 +102,62 @@ test('a malformed Authorization header (no "Bearer " prefix) is rejected, not cr
   const res = fakeRes();
   assert.doesNotThrow(() => requireAdminToken(req, res, () => {}));
   assert.equal(res.statusCode, 404);
+});
+
+// --- rotation (ADMIN_TOKEN_PREVIOUS) ------------------------------------
+
+test('during a rotation, the OLD token (ADMIN_TOKEN_PREVIOUS) still passes', () => {
+  process.env.ADMIN_TOKEN = 'new-secret';
+  process.env.ADMIN_TOKEN_PREVIOUS = 'old-secret';
+  const req = fakeReq({ 'x-admin-token': 'old-secret' });
+  const res = fakeRes();
+  let called = false;
+  requireAdminToken(req, res, () => { called = true; });
+  assert.equal(called, true, 'a holder who has not yet picked up the new token must not be locked out mid-rotation');
+});
+
+test('during a rotation, the NEW token also passes', () => {
+  process.env.ADMIN_TOKEN = 'new-secret';
+  process.env.ADMIN_TOKEN_PREVIOUS = 'old-secret';
+  const req = fakeReq({ 'x-admin-token': 'new-secret' });
+  const res = fakeRes();
+  let called = false;
+  requireAdminToken(req, res, () => { called = true; });
+  assert.equal(called, true);
+});
+
+test('a token that is neither current nor previous still 404s during a rotation', () => {
+  process.env.ADMIN_TOKEN = 'new-secret';
+  process.env.ADMIN_TOKEN_PREVIOUS = 'old-secret';
+  const req = fakeReq({ 'x-admin-token': 'some-other-guess' });
+  const res = fakeRes();
+  let called = false;
+  requireAdminToken(req, res, () => { called = true; });
+  assert.equal(called, false);
+  assert.equal(res.statusCode, 404);
+});
+
+test('ADMIN_TOKEN_PREVIOUS supports multiple comma-separated retired tokens', () => {
+  process.env.ADMIN_TOKEN = 'newest';
+  process.env.ADMIN_TOKEN_PREVIOUS = 'oldest, middle';
+  for (const token of ['newest', 'oldest', 'middle']) {
+    const req = fakeReq({ 'x-admin-token': token });
+    const res = fakeRes();
+    let called = false;
+    requireAdminToken(req, res, () => { called = true; });
+    assert.equal(called, true, `expected ${token} to pass`);
+  }
+});
+
+test('once ADMIN_TOKEN_PREVIOUS is removed, the retired token stops working -- rotation actually completes', () => {
+  // Simulates the SECOND deploy of a rotation (docs/secrets-rotation.md):
+  // the first deploy set both ADMIN_TOKEN and ADMIN_TOKEN_PREVIOUS; this
+  // one drops ADMIN_TOKEN_PREVIOUS once the rotation window has passed.
+  process.env.ADMIN_TOKEN = 'new-secret';
+  delete process.env.ADMIN_TOKEN_PREVIOUS;
+  const req = fakeReq({ 'x-admin-token': 'old-secret' });
+  const res = fakeRes();
+  let called = false;
+  requireAdminToken(req, res, () => { called = true; });
+  assert.equal(called, false, 'the retired token must actually stop working once rotation is declared complete');
 });
