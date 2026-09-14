@@ -434,6 +434,32 @@ Phase 1, early. What exists and is tested:
   hit to trip for real, which wasn't worth the test runtime for no
   additional confidence. Full suite is now 223 tests.
 
+- **CI and the first admin-tooling surface** -- closing the "ops surface"
+  gap from the "is project ready" review.
+  `.github/workflows/ci.yml` runs the same three suites this project has
+  relied on throughout (backend against a real Postgres service container,
+  worker against real Docker, frontend build+lint) on every push and PR --
+  no new testing strategy, just running what already existed on every
+  change instead of only when someone remembers to.
+
+  `GET /admin/ops-summary` surfaces the two categories of row this project
+  has always needed a human to look at but never exposed anywhere:
+  `refund_retries` rows that hit the retry ceiling (the migration's own
+  comment already called this out) and disputes still waiting on a
+  tiebreaker. There's still no role system (see the manual-settlement
+  gate for the same honest gap), so this sits behind a separate shared
+  secret (`auth/adminToken.js`'s `ADMIN_TOKEN`, timing-safe compared, 404
+  rather than 401/403 when disabled or wrong) rather than a normal
+  session's JWT -- an ordinary user's own token must never be able to read
+  every user's stuck refunds and every provider's open disputes just
+  because JWT auth happens to be checked first.
+
+  Tested at the unit level (`adminToken.test.js`: disabled-by-default,
+  wrong token, missing header, mismatched-length token) and via a full
+  live dispute+tiebreak cycle (`dispute-resolution.test.js`) proving a
+  fresh dispute appears under `awaiting_tiebreak` and moves out of it once
+  actually resolved. Full suite is now 231 tests.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.

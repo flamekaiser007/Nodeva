@@ -20,6 +20,7 @@ import { reputationEffect } from '../providers/reputation.js';
 import { hashPassword, verifyPassword } from '../auth/password.js';
 import { requireJwtSecret, signSession } from '../auth/jwt.js';
 import { requireAuth } from '../auth/middleware.js';
+import { requireAdminToken } from '../auth/adminToken.js';
 import { generateResetToken, hashResetToken } from '../auth/passwordReset.js';
 import { rateLimit } from '../auth/rateLimit.js';
 import { checkImageAllowed } from '../jobs/imageAllowlist.js';
@@ -1104,6 +1105,54 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
         [req.params.id, req.userId]);
       if (!rows[0]) return res.status(404).json({ error: 'not_found' });
       res.json(rows[0]);
+    } catch (e) { next(e); }
+  });
+
+  // The admin-tooling gap this project has had since day one: nothing
+  // surfaced the two categories of row that explicitly need a human to
+  // look at them -- refund_retries rows that hit the retry ceiling
+  // (refund_retries' own migration comment: "this is the row a human
+  // actually needs to look at") and disputes still waiting on a
+  // tiebreaker. Cross-tenant by nature (every user's stuck refunds, every
+  // provider's open disputes), so it sits behind requireAdminToken, not
+  // requireAuth -- see auth/adminToken.js for why a normal session's JWT
+  // is deliberately not accepted here.
+  app.get('/admin/ops-summary', requireAdminToken, async (req, res, next) => {
+    try {
+      const refundRetryCounts = await pool.query(
+        `SELECT status, count(*)::int AS n FROM refund_retries GROUP BY status`);
+      const exhaustedRefunds = await pool.query(
+        `SELECT retry_id, payment_id, reservation_id, gateway_ref, amount_paise, attempts, last_error, updated_at
+           FROM refund_retries WHERE status = 'exhausted'
+          ORDER BY updated_at DESC LIMIT 50`);
+
+      const disputeCounts = await pool.query(
+        `SELECT
+            count(*) FILTER (WHERE dr.resolution_id IS NULL)::int AS awaiting_tiebreaker,
+            count(*) FILTER (WHERE dr.verdict = 'attributed')::int AS resolved_attributed,
+            count(*) FILTER (WHERE dr.verdict = 'inconclusive')::int AS resolved_inconclusive
+           FROM reservations r
+           JOIN jobs j ON j.reservation_id = r.reservation_id
+           LEFT JOIN dispute_resolutions dr ON dr.verification_group_id = j.verification_group_id
+          WHERE r.status = 'disputed'`);
+      const awaitingTiebreak = await pool.query(
+        `SELECT DISTINCT r.reservation_id, r.node_id, r.updated_at AS disputed_at
+           FROM reservations r
+           JOIN jobs j ON j.reservation_id = r.reservation_id
+           LEFT JOIN dispute_resolutions dr ON dr.verification_group_id = j.verification_group_id
+          WHERE r.status = 'disputed' AND dr.resolution_id IS NULL
+          ORDER BY r.updated_at DESC LIMIT 50`);
+
+      res.json({
+        refund_retries: {
+          by_status: Object.fromEntries(refundRetryCounts.rows.map((r) => [r.status, r.n])),
+          exhausted: exhaustedRefunds.rows,
+        },
+        disputes: {
+          ...disputeCounts.rows[0],
+          awaiting_tiebreak: awaitingTiebreak.rows,
+        },
+      });
     } catch (e) { next(e); }
   });
 

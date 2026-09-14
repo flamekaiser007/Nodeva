@@ -461,3 +461,55 @@ test("an inconclusive tiebreak still shows as resolved on the provider dashboard
       'the dashboard must reflect the resolution, not report it as still pending');
     assert.equal(dash.disputes[0].resolution.outcome, null);
   });
+
+// --- GET /admin/ops-summary --------------------------------------------
+
+test('ops-summary is disabled (404) without ADMIN_TOKEN set', { skip }, async () => {
+  delete process.env.ADMIN_TOKEN;
+  const res = await fetch(`${base}/admin/ops-summary`);
+  assert.equal(res.status, 404);
+});
+
+test('ops-summary rejects the wrong token, even when one is configured', { skip }, async () => {
+  process.env.ADMIN_TOKEN = 'test-admin-secret';
+  try {
+    const res = await fetch(`${base}/admin/ops-summary`, { headers: { 'x-admin-token': 'wrong' } });
+    assert.equal(res.status, 404);
+  } finally {
+    delete process.env.ADMIN_TOKEN;
+  }
+});
+
+test('ops-summary lists an unresolved dispute under awaiting_tiebreak, then moves it once resolved',
+  { skip }, async () => {
+    process.env.ADMIN_TOKEN = 'test-admin-secret';
+    try {
+      const buyer = await signupBuyer();
+      const { a, b, groupId } = await disputeTwoNodes(buyer, 80);
+
+      const before = await json(await fetch(`${base}/admin/ops-summary`, {
+        headers: { 'x-admin-token': 'test-admin-secret' },
+      }));
+      const beforeIds = before.disputes.awaiting_tiebreak.map((d) => d.reservation_id);
+      assert.ok(beforeIds.includes(a.reservation_id) || beforeIds.includes(b.reservation_id),
+        'the fresh dispute must appear as awaiting a tiebreaker');
+
+      const c = await setUpConfirmedReservation(buyer.token, 83);
+      c.worker.scriptResult({ status: 'succeeded', exit_code: 0, stdout: 'REAL OUTPUT\n', stderr: '' });
+      await fetch(`${base}/verification-groups/${groupId}/tiebreak`, {
+        method: 'POST', headers: { ...authed(buyer.token), 'content-type': 'application/json' },
+        body: JSON.stringify({ reservation_id: c.reservation_id }),
+      });
+      await waitForResolution(groupId);
+
+      const after = await json(await fetch(`${base}/admin/ops-summary`, {
+        headers: { 'x-admin-token': 'test-admin-secret' },
+      }));
+      const afterIds = after.disputes.awaiting_tiebreak.map((d) => d.reservation_id);
+      assert.ok(!afterIds.includes(a.reservation_id) && !afterIds.includes(b.reservation_id),
+        'a resolved dispute must no longer show as awaiting a tiebreaker');
+      assert.ok(after.disputes.resolved_attributed >= before.disputes.resolved_attributed + 1);
+    } finally {
+      delete process.env.ADMIN_TOKEN;
+    }
+  });
