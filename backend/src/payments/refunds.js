@@ -1,3 +1,6 @@
+import { logger } from '../observability/logger.js';
+import { refundRetriesExhaustedTotal } from '../observability/metrics.js';
+
 // Compensating refunds: the single place that issues a refund through the
 // gateway and records what happens. Before this module existed, the same
 // try/refund/catch-and-log shape was duplicated three times across
@@ -68,9 +71,10 @@ export async function processRefundRetries(pool, gateway) {
       await pool.query('ROLLBACK').catch(() => {});
       const attempts = row.attempts + 1;
       if (attempts >= MAX_ATTEMPTS) {
-        console.error(
-          `CRITICAL: refund for payment ${row.payment_id} (${row.amount_paise} paise) has failed ` +
-          `${attempts} times and is now EXHAUSTED -- manual refund required:`, e);
+        logger.error('refund retries exhausted -- manual refund required', {
+          payment_id: row.payment_id, amount_paise: row.amount_paise, attempts, error: e,
+        });
+        refundRetriesExhaustedTotal.inc();
         await pool.query(
           "UPDATE refund_retries SET status='exhausted', attempts=$2, last_error=$3, updated_at=now() WHERE retry_id=$1",
           [row.retry_id, attempts, String(e.message ?? e)]);

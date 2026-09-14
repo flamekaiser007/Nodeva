@@ -618,6 +618,61 @@ Phase 1, early. What exists and is tested:
   just two objects in one Node runtime. Backend suite (246 tests, +6),
   worker suite (48), frontend suite (30), and e2e_demo.sh all green.
 
+- **Structured logging and real Prometheus metrics.** `admin/ops-summary`
+  was one hand-built query, not observability -- nothing answered "how
+  many reservations/hour", "what's the job-submission error rate", or "is
+  a specific route getting slow" without querying Postgres by hand or
+  reading free-form `console.log` lines.
+
+  `observability/logger.js` is a small, dependency-free JSON-line logger
+  (same "stdlib over a framework" posture as `nvidia-smi` over an NVML
+  binding, or stdlib-only CPU/RAM detection) -- every line is
+  `{timestamp, level, msg, ...fields}`, `.child()` carries fields (a
+  request id) onto every subsequent line without every call site
+  remembering to pass it, and an `Error` passed as a field is serialized
+  properly (name/message/stack) instead of `JSON.stringify`-ing to `{}`.
+  Wired into the money-critical paths that most needed it: `onJobResult`'s
+  settlement failures, the webhook handler, verification-group and
+  tiebreaker settlement, and `index.js`'s four periodic sweeps -- not a
+  wholesale rewrite of every `console.log` in the codebase, since that
+  would be a large, high-risk diff for comparatively little value over
+  targeting the sites that were already explicitly commented "money must
+  not silently fail" or "the row a human needs to look at". A request-id
+  middleware (`x-request-id`, generated or passed through from an upstream
+  proxy) tags every log line touched by one request and echoes back as a
+  response header, so concurrent requests' log lines can be told apart.
+
+  `observability/metrics.js` uses `prom-client` (the long-standing
+  official Node.js client, kept over its brand-new, weeks-old, pre-1.0
+  successor `@prometheus-io/client` for the same reason this project
+  avoids other unproven dependencies) to expose real Node.js process
+  metrics plus five business counters/histograms incremented at exactly
+  the call sites that already decide the outcome they count:
+  reservations created, reservations settled (by outcome), jobs submitted
+  (by whether verification was requested), dispute tiebreakers resolved
+  (by verdict), and refund retries exhausted. `GET /metrics` reuses
+  `requireAdminToken` -- Prometheus's own `bearer_token` scrape option
+  authenticates against it like any other client, and route-level traffic
+  shape is real operational detail, not something to leave unauthenticated
+  by default. The HTTP metrics middleware labels by Express's matched
+  ROUTE PATTERN (`/reservations/:id`), never the literal URL -- labeling
+  by URL would create one label series per UUID ever generated, a
+  textbook way to take down a real Prometheus server with unbounded
+  cardinality.
+
+  Tested at the unit level (7 logger tests: level filtering, Error
+  serialization, child-field inheritance) and via real HTTP integration
+  (7 metrics tests) proving `/metrics` is gated exactly like
+  `/admin/ops-summary`, that a route with a UUID param is labeled by
+  pattern not literal URL, and -- using a real signed-receipt reservation
+  flow, not a mock -- that `nodeva_reservations_created_total` reads 0
+  for an attempt that never actually created a row and exactly 1 once one
+  genuinely was. Verified live against a real running instance: a real
+  structured JSON startup log line, a real `x-request-id` response
+  header, and real Prometheus exposition text (including default Node.js
+  process metrics) served only with the correct `ADMIN_TOKEN`. Backend
+  suite is now 260 tests.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.

@@ -3,6 +3,7 @@ import { createPool } from './db/pool.js';
 import { createApp, attachWebSocketServer } from './api/server.js';
 import { expireStaleHolds, reconcileExpiredMismatches } from './reservations/reconciler.js';
 import { processRefundRetries } from './payments/refunds.js';
+import { logger } from './observability/logger.js';
 
 const pool = createPool();
 const { app, hub, paymentGateway } = createApp(pool);
@@ -21,7 +22,7 @@ setInterval(() => hub.sweepStale(), 15_000);
 // expired-but-marked-held forever without it, permanently squatting on that
 // time window for no reason.
 setInterval(() => {
-  expireStaleHolds(pool).catch((e) => console.error('reconciler sweep failed:', e));
+  expireStaleHolds(pool).catch((e) => logger.error('reconciler sweep failed', { error: e }));
 }, 15_000);
 
 // The reservation-status-query reconciliation: for the narrower, rarer case
@@ -31,7 +32,7 @@ setInterval(() => {
 // often than the others -- it involves a network round trip PER candidate
 // reservation, unlike the other two sweeps which are pure SQL.
 setInterval(() => {
-  reconcileExpiredMismatches(pool, hub).catch((e) => console.error('mismatch reconciliation sweep failed:', e));
+  reconcileExpiredMismatches(pool, hub).catch((e) => logger.error('mismatch reconciliation sweep failed', { error: e }));
 }, 60_000);
 
 // Retries a compensating refund that failed on its first attempt (gateway
@@ -39,8 +40,8 @@ setInterval(() => {
 // (processRefundRetries checks isConfigured itself) when no live gateway is
 // configured, since there is nothing to retry against.
 setInterval(() => {
-  processRefundRetries(pool, paymentGateway).catch((e) => console.error('refund retry sweep failed:', e));
+  processRefundRetries(pool, paymentGateway).catch((e) => logger.error('refund retry sweep failed', { error: e }));
 }, 30_000);
 
 const port = process.env.PORT ?? 3000;
-server.listen(port, () => console.log(`nodeva backend listening on :${port}`));
+server.listen(port, () => logger.info('nodeva backend listening', { port }));

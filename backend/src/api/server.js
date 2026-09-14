@@ -25,6 +25,11 @@ import { requireAdminToken } from '../auth/adminToken.js';
 import { generateResetToken, hashResetToken } from '../auth/passwordReset.js';
 import { rateLimit } from '../auth/rateLimit.js';
 import { checkImageAllowed } from '../jobs/imageAllowlist.js';
+import { logger } from '../observability/logger.js';
+import {
+  registry, metricsMiddleware, reservationsCreatedTotal, reservationsSettledTotal,
+  jobsSubmittedTotal, disputeResolutionsTotal,
+} from '../observability/metrics.js';
 import { createEmailSenderFromEnv, resetPasswordEmailBody } from '../auth/email.js';
 import {
   createGatewayFromEnv, verifyPaymentSignature, verifyWebhookSignature,
@@ -104,6 +109,22 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   // dev server). Not something to carry into a real deployment unchanged --
   // production should allow-list the actual frontend origin, not '*'.
   app.use(cors());
+  // A request id lets every log line touched while handling ONE request be
+  // grepped/joined together after the fact -- without this, two concurrent
+  // requests' log lines interleave with no way to tell which line belongs
+  // to which. Trusts an incoming x-request-id (a load balancer or upstream
+  // proxy may already have assigned one for this exact purpose) rather
+  // than always minting a fresh one, so a trace started further upstream
+  // doesn't get discarded here.
+  app.use((req, res, next) => {
+    req.requestId = req.get('x-request-id') || crypto.randomUUID();
+    req.log = logger.child({ request_id: req.requestId });
+    res.set('x-request-id', req.requestId);
+    next();
+  });
+  // Registered before any route so it wraps every request, regardless of
+  // which handler (or none, for a 404) eventually serves it.
+  app.use(metricsMiddleware);
   // `verify` captures the exact raw bytes alongside the parsed body -- the
   // Razorpay webhook handler below needs those raw bytes for signature
   // verification (re-serializing req.body is not guaranteed to reproduce
@@ -169,7 +190,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
            Math.round(msg.duration_seconds ?? 0), msg.stdout ?? null, msg.stderr ?? null, resultHash]);
         const jobRow = rows[0];
         if (!jobRow) {
-          console.error(`JOB_RESULT for unknown job ${msg.job_id}`);
+          logger.error('JOB_RESULT for unknown job', { job_id: msg.job_id, node_id: nodeId });
           return;
         }
 
@@ -183,7 +204,9 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
           // stuck at 'confirmed' forever with no log line the first time
           // this ran.
           if (result.error) {
-            console.error(`settlement failed for reservation ${jobRow.reservation_id} (job ${msg.job_id}): ${result.error}`);
+            logger.error('settlement failed', {
+              reservation_id: jobRow.reservation_id, job_id: msg.job_id, error: result.error,
+            });
           }
           return;
         }
@@ -206,7 +229,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
         // Money must not silently fail to settle. This is exactly the class
         // of drift docs/reservation-protocol.md's reconciler exists for; for
         // now, loud logging is the safety net until that reconciler exists.
-        console.error(`failed to settle reservation for job ${msg.job_id} from node ${nodeId}:`, e);
+        logger.error('failed to settle reservation for job result', { job_id: msg.job_id, node_id: nodeId, error: e });
       }
     },
   });
@@ -306,7 +329,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
         await mailer.send({
           to: email,
           subject: 'Reset your NODEVA password', text: resetPasswordEmailBody(resetUrl),
-        }).catch((e) => console.error('failed to send password reset email:', e));
+        }).catch((e) => logger.error('failed to send password reset email', { error: e }));
       }
       res.json(GENERIC_RESPONSE);
     } catch (e) { next(e); }
@@ -617,6 +640,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
          Buffer.from(receiptMsg.signature_hex, 'hex'), receiptMsg.body,
          new Date(receiptMsg.body.hold_expires_at)]);
 
+      reservationsCreatedTotal.inc();
       res.status(201).json({
         reservation_id: reservationId, status: S.HELD, quoted_paise: quotedPaise,
         hold_expires_at: receiptMsg.body.hold_expires_at,
@@ -843,7 +867,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
           }
         }
       } catch (e) {
-        console.error('failed to process payment.captured webhook:', e);
+        logger.error('failed to process payment.captured webhook', { error: e });
       }
     }
     // Razorpay only cares that this returns 2xx; the actual side effect
@@ -996,12 +1020,13 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
           await pool.query('UPDATE jobs SET verification_group_id = NULL WHERE job_id = $1', [jobId]);
           verificationDegraded = true;
           siblingJobId = null;
-          console.warn(
-            `verification sibling submission failed for reservation ${verify_against_reservation_id} -- ` +
-            `job ${jobId} continues solo, unverified:`, e.message ?? e);
+          logger.warn('verification sibling submission failed -- job continues solo, unverified', {
+            verify_against_reservation_id, job_id: jobId, error: e,
+          });
         }
       }
 
+      jobsSubmittedTotal.inc({ verified: sibling ? 'true' : 'false' });
       res.status(202).json({
         job_id: jobId, status: 'running',
         ...(sibling ? { verification_degraded: verificationDegraded, sibling_job_id: siblingJobId } : {}),
@@ -1088,6 +1113,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
         "UPDATE reservations SET status='running', updated_at=now() WHERE reservation_id=$1",
         [tiebreakerResv.reservation_id]);
 
+      jobsSubmittedTotal.inc({ verified: 'tiebreak' });
       res.status(202).json({ job_id: jobId, status: 'running' });
     } catch (e) { next(e); }
   });
@@ -1167,10 +1193,24 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
     } catch (e) { next(e); }
   });
 
+  // Prometheus scrape target. Gated behind the same requireAdminToken as
+  // /admin/ops-summary -- request/route-level counts are lower-sensitivity
+  // than that endpoint's per-user financial data, but still real
+  // operational detail (which routes exist, their traffic shape) not
+  // meant to be public. A scrape config authenticates via the
+  // `Authorization: Bearer <ADMIN_TOKEN>` header (Prometheus's
+  // `bearer_token` scrape option), same as any other client of this route.
+  app.get('/metrics', requireAdminToken, async (req, res, next) => {
+    try {
+      res.set('Content-Type', registry.contentType);
+      res.send(await registry.metrics());
+    } catch (e) { next(e); }
+  });
+
   app.get('/health', (req, res) => res.json({ ok: true }));
 
   app.use((err, req, res, _next) => {
-    console.error(err);
+    (req.log ?? logger).error('unhandled request error', { error: err, method: req.method, path: req.path });
     res.status(500).json({ error: 'internal_error' });
   });
 
@@ -1320,16 +1360,16 @@ async function settleVerificationGroup(pool, paymentGateway, groupId) {
     : () => S.DISPUTED;
 
   if (verdict === 'mismatch') {
-    console.warn(
-      `verification group ${groupId} MISMATCHED (jobs ${jobs.map((j) => j.job_id).join(', ')}) ` +
-      `-- disputing both reservations, refunding in full. Cannot attribute fault from two samples alone.`);
+    logger.warn('verification group mismatched -- disputing both reservations, refunding in full', {
+      verification_group_id: groupId, job_ids: jobs.map((j) => j.job_id),
+    });
   }
 
   for (const job of jobs) {
     const result = await settleReservation(
       pool, job.reservation_id, settleAs(job), job.compute_seconds ?? 0, paymentGateway);
     if (result.error) {
-      console.error(`verification-group settlement failed for reservation ${job.reservation_id}: ${result.error}`);
+      logger.error('verification-group settlement failed', { reservation_id: job.reservation_id, error: result.error });
     }
   }
 }
@@ -1363,9 +1403,9 @@ async function resolveDisputeTiebreaker(pool, paymentGateway, groupId) {
   const original = jobs.filter((j) => j.reservation_status === S.DISPUTED);
   const tiebreaker = jobs.find((j) => j.reservation_status !== S.DISPUTED);
   if (original.length !== 2 || !tiebreaker) {
-    console.error(
-      `verification group ${groupId} has 3 jobs but not the expected shape ` +
-      `(2 disputed + 1 fresh) -- skipping fault attribution`, jobs.map((j) => j.reservation_status));
+    logger.error('verification group has 3 jobs but not the expected shape -- skipping fault attribution', {
+      verification_group_id: groupId, reservation_statuses: jobs.map((j) => j.reservation_status),
+    });
     return;
   }
 
@@ -1373,7 +1413,7 @@ async function resolveDisputeTiebreaker(pool, paymentGateway, groupId) {
     pool, tiebreaker.reservation_id, jobRowStatusToOutcome(tiebreaker.status),
     tiebreaker.compute_seconds ?? 0, paymentGateway);
   if (result.error) {
-    console.error(`tiebreaker settlement failed for reservation ${tiebreaker.reservation_id}: ${result.error}`);
+    logger.error('tiebreaker settlement failed', { reservation_id: tiebreaker.reservation_id, error: result.error });
   }
 
   const client = await pool.connect();
@@ -1390,14 +1430,15 @@ async function resolveDisputeTiebreaker(pool, paymentGateway, groupId) {
     if (verdict.verdict === 'attributed') {
       const atFaultProviderId = await providerIdForNode(client, verdict.atFault.node_id);
       await bumpReputation(client, atFaultProviderId, 'failure');
-      console.warn(
-        `verification group ${groupId}: tiebreaker attributes fault to reservation ` +
-        `${verdict.atFault.reservation_id} (node ${verdict.atFault.node_id}); ` +
-        `${verdict.vindicated.reservation_id} vindicated. No money moves -- both were already refunded in full.`);
+      logger.warn('tiebreaker attributed fault -- no money moves, both already refunded in full', {
+        verification_group_id: groupId,
+        at_fault_reservation_id: verdict.atFault.reservation_id, at_fault_node_id: verdict.atFault.node_id,
+        vindicated_reservation_id: verdict.vindicated.reservation_id,
+      });
     } else {
-      console.warn(
-        `verification group ${groupId}: tiebreaker result agrees with neither original node -- ` +
-        `still inconclusive, no fault attributed.`);
+      logger.warn('tiebreaker inconclusive -- agrees with neither original node, no fault attributed', {
+        verification_group_id: groupId,
+      });
     }
 
     await client.query(
@@ -1408,6 +1449,7 @@ async function resolveDisputeTiebreaker(pool, paymentGateway, groupId) {
       [groupId, tiebreaker.reservation_id, tiebreaker.job_id, verdict.verdict,
         verdict.vindicated?.reservation_id ?? null, verdict.atFault?.reservation_id ?? null]);
     await client.query('COMMIT');
+    disputeResolutionsTotal.inc({ verdict: verdict.verdict });
   } catch (e) {
     await client.query('ROLLBACK').catch(() => {});
     if (e.code === '23505') return; // lost the race to a concurrent resolution -- fine, already recorded
@@ -1538,6 +1580,7 @@ export async function settleReservation(pool, reservationId, outcome, computeSec
     await bumpReputation(client, providerId, reputationEffect(outcome));
 
     await client.query('COMMIT');
+    reservationsSettledTotal.inc({ outcome });
 
     // If real money was collected through a live gateway for this
     // reservation, a refund owed here must actually reach the user, not
