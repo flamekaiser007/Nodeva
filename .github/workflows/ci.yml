@@ -8,6 +8,14 @@ name: CI
 # under scripts/e2e_demo.sh and each package's own test script, so a
 # regression is caught before merge instead of only when someone
 # remembers to run tests locally.
+#
+# Each job also runs a real dependency vulnerability audit (npm audit /
+# pip-audit) before its test suite -- this had never actually been checked
+# before (npm audit couldn't even reach the registry in the sandbox this
+# was developed in, due to an unrelated local npm misconfiguration; a real
+# CI runner has no such problem). Found and fixed one real moderate-severity
+# issue (qs, a transitive dependency of express) via an `overrides` entry
+# rather than a breaking Express major-version bump.
 on:
   push:
     branches: [main, master]
@@ -40,6 +48,9 @@ jobs:
       - name: Install dependencies
         working-directory: backend
         run: npm install
+      - name: Audit dependencies
+        working-directory: backend
+        run: npm audit --audit-level=moderate
       - name: Apply migrations
         working-directory: backend
         run: npm run migrate
@@ -56,6 +67,8 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: pip install -r worker/requirements-dev.txt
+      - name: Audit dependencies
+        run: pip install pip-audit && pip-audit -r worker/requirements-dev.txt
       - name: Pull the base image used by executor tests
         # Avoids the first real test paying for a cold pull, and makes a
         # registry hiccup fail as a clear, separate step rather than an
@@ -74,6 +87,9 @@ jobs:
       - name: Install dependencies
         working-directory: frontend
         run: npm install
+      - name: Audit dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=moderate
       - name: Lint
         working-directory: frontend
         run: npm run lint

@@ -545,6 +545,31 @@ Phase 1, early. What exists and is tested:
   rediscovered the hard way later. CI's frontend job now runs `npm test`
   between lint and build.
 
+- **Dependency vulnerability scanning, actually run for the first time.**
+  `npm audit` had never successfully completed in this project's dev
+  environment -- it couldn't reach the registry's audit endpoint at all,
+  due to a LOCAL npm misconfiguration (a user-level `.npmrc` forcing
+  plaintext `http://registry.npmjs.org/` and `strict-ssl=false`, unrelated
+  to this project). Ran it for real with `--registry=https://...`
+  overriding that locally, which found one genuine moderate-severity
+  issue: `qs` (Express's query-string parser, pulled in transitively at
+  `~6.15.1`) had two known advisories fixed in `6.16.0` -- express itself
+  doesn't request that version, and `body-parser` (also an express
+  dependency) already resolved to the patched 6.16.0 independently,
+  leaving two different `qs` copies at two different safety levels in the
+  same tree. Fixed via a `package.json` `overrides` entry pinning `qs` to
+  `^6.16.0` everywhere, rather than `npm audit fix --force`'s suggested
+  path of a breaking Express 4→5 major upgrade -- the smaller, targeted
+  fix for what was actually a transitive-dependency version drift, not a
+  reason to redo every route's error-handling behavior. Frontend and the
+  worker's Python dependencies (via `pip-audit`) were already clean.
+
+  All three ecosystems now audited automatically in CI, before each job's
+  own test suite, so this can't silently regress unnoticed again. Backend
+  suite (240 tests) reverified unaffected by the `qs` bump, since Express
+  itself is unchanged; e2e_demo.sh and the worker suite (48 tests) both
+  green.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.
