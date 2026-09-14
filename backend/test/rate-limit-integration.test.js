@@ -2,11 +2,13 @@
 // proves it is actually WIRED into the real app on the real routes, not
 // just imported and forgotten -- exercised via real HTTP against the real
 // Express app, same discipline as every other endpoint test in this suite.
-// Only the login-by-email limiter (the smallest max) is exercised for
-// real; server.js's other two (signup, login-by-IP) use a max in the
-// dozens-to-hundreds, which would make this test slow for no extra
-// confidence -- the middleware's own generic behavior is already proven
-// by rateLimit.test.js.
+// Only the login-by-email and search limiters (the cheapest to actually
+// trip for real) are exercised end to end; server.js's other limiters
+// (signup, login-by-IP, reservation, job-submit) use a max in the
+// dozens-to-hundreds and/or require a full reservation per hit, which
+// would make this test slow for no extra confidence -- the middleware's
+// own generic behavior is already proven by rateLimit.test.js, and every
+// limiter is built from the same rateLimit() factory wired the same way.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -61,4 +63,24 @@ test("rate-limiting one email's login attempts does not affect a different email
   assert.equal(targetRes.status, 429);
   const bystanderRes = await login(bystander);
   assert.equal(bystanderRes.status, 401, "a different email's login must not be blocked by someone else's limit");
+});
+
+function search() {
+  return fetch(`${base}/search`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      min_vram_mb: 1, min_cpu_cores: 1, min_ram_mb: 1,
+      starts_at: Date.UTC(2034, 0, 1), ends_at: Date.UTC(2034, 0, 1, 1),
+    }),
+  });
+}
+
+test('repeated unauthenticated searches from one IP are rate-limited (server.js max is 120/min)', { skip }, async () => {
+  for (let i = 0; i < 120; i++) {
+    const res = await search();
+    assert.equal(res.status, 200, `search ${i + 1} of 120 should succeed, not be rate-limited yet`);
+  }
+  const res = await search();
+  assert.equal(res.status, 429, 'the 121st search within the window must be rate-limited');
+  assert.ok(res.headers.get('retry-after'));
 });

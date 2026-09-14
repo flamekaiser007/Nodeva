@@ -420,6 +420,20 @@ Phase 1, early. What exists and is tested:
   doesn't crash, stays internally consistent, and reproduces exactly given
   the same seed. Full suite is now 220 tests.
 
+- **Extended rate limiting to `/search`, `/reservations`, and
+  `/reservations/:id/jobs`** -- previously only the three pre-session auth
+  endpoints were throttled. `/search` (unauthenticated) is limited by IP
+  (120/min); reservation creation and job submission run AFTER `auth`, so
+  they're limited per authenticated user (30/15min, 60/15min) rather than
+  by IP, since the concern there is a runaway or malicious client hammering
+  its OWN account, not credential-style abuse. All three reuse the same
+  `rateLimit()` factory from the auth work, wired the same way. Verified
+  live against the real app for the two cheapest-to-trip limiters
+  (login-by-email, search); the reservation and job-submit limiters share
+  the same already-tested factory and would need a full reservation per
+  hit to trip for real, which wasn't worth the test runtime for no
+  additional confidence. Full suite is now 223 tests.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.

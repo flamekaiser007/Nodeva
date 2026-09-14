@@ -66,6 +66,21 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   const forgotPasswordLimiter = rateLimit({
     windowMs: 15 * 60_000, max: 10, keyFn: (req) => `forgot-password:${req.ip}`,
   });
+  // /search is unauthenticated (no session to key on, and it must stay
+  // usable before signup) -- by IP, generous enough for real browsing
+  // (adjusting filters, re-searching) while still bounding a scraper.
+  const searchLimiter = rateLimit({ windowMs: 60_000, max: 120, keyFn: (req) => `search:${req.ip}` });
+  // These two run AFTER `auth`, so req.userId is real, not client-supplied --
+  // keyed per user rather than per IP since the actions they gate (locking
+  // a node's slot with a hold, occupying a worker with a job) are already
+  // authenticated and priced; the concern here is a runaway or malicious
+  // client hammering its OWN account, not credential-style abuse.
+  const reservationLimiter = rateLimit({
+    windowMs: 15 * 60_000, max: 30, keyFn: (req) => `reservation:${req.userId}`,
+  });
+  const jobSubmitLimiter = rateLimit({
+    windowMs: 15 * 60_000, max: 60, keyFn: (req) => `job-submit:${req.userId}`,
+  });
   // Injectable for tests; defaults to reading RAZORPAY_KEY_ID/SECRET from the
   // environment. Falls back to UnconfiguredGateway (loud, honest, ledger-only)
   // when they are absent -- see payments/razorpay.js's file header for what
@@ -513,7 +528,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
 
   // --- search ------------------------------------------------------------
 
-  app.post('/search', async (req, res, next) => {
+  app.post('/search', searchLimiter, async (req, res, next) => {
     try {
       const req_ = req.body;
       const candidates = await searchCandidates(pool, hub, req_);
@@ -529,7 +544,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   // user_id comes from the session, never the request body -- previously a
   // caller could book (and later confirm/run jobs on) a reservation under
   // ANY user_id they cared to type in, since nothing verified they owned it.
-  app.post('/reservations', auth, async (req, res, next) => {
+  app.post('/reservations', auth, reservationLimiter, async (req, res, next) => {
     const { node_id, starts_at, ends_at } = req.body;
     const user_id = req.userId;
     try {
@@ -872,7 +887,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   // decides automatically that a job is worth the doubled cost of running
   // twice, see jobs/verification.js's file header for the honest limits of
   // what two-node comparison can and cannot prove.
-  app.post('/reservations/:id/jobs', auth, async (req, res, next) => {
+  app.post('/reservations/:id/jobs', auth, jobSubmitLimiter, async (req, res, next) => {
     try {
       const { rows } = await pool.query(
         'SELECT * FROM reservations WHERE reservation_id = $1', [req.params.id]);
