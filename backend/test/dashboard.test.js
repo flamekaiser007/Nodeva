@@ -389,3 +389,32 @@ test('retiring a node with a live reservation is refused, not silently orphaning
   assert.ok(dash.nodes.find((n) => n.node_id === node_id), 'must still be listed -- the retire was refused');
   worker.sock.close();
 });
+
+// --- re-enrolling with an already-registered public key -----------------
+
+test('enrolling a node with a public key that is already registered gives a clean 409, not a raw 500', { skip }, async () => {
+  const { token } = await signup('Duplicate Key Provider');
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+  const publicKeyHex = crypto.randomBytes(32).toString('hex');
+  const body = JSON.stringify({
+    public_key_hex: publicKeyHex, gpu_model: 'RTX 4090',
+    gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+  });
+  const first = await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' }, body,
+  });
+  assert.equal(first.status, 201);
+
+  // Exactly the real-world scenario the NodeIdentity ~-expansion bug used
+  // to cause: re-running the enrollment CLI snippet is now correctly
+  // idempotent about which key it returns, so re-enrolling the SAME
+  // physical machine hits this constraint for real.
+  const second = await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' }, body,
+  });
+  assert.equal(second.status, 409);
+  const secondBody = await second.json();
+  assert.match(secondBody.error, /already enrolled/);
+  assert.doesNotMatch(secondBody.error, /constraint|pg-pool|duplicate key value/,
+    'must not leak the raw Postgres error message to the client');
+});

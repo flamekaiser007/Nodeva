@@ -532,7 +532,25 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
         [providerRow.rows[0].provider_id, pub, gpu_model, gpu_vram_mb, cpu_cores, ram_mb,
          price_paise_hr, cuda_version ?? null]);
       res.status(201).json({ node_id: rows[0].node_id });
-    } catch (e) { next(e); }
+    } catch (e) {
+      // compute_nodes.public_key is UNIQUE -- hit in practice by exactly
+      // the scenario the NodeIdentity ~-expansion bug (identity.py) used
+      // to cause: re-running the enrollment CLI snippet is now correctly
+      // idempotent about WHICH key it returns, so a provider re-enrolling
+      // the same physical machine (retried after a failed attempt, or
+      // just running the snippet again to double-check) gets the exact
+      // same public key back and hits this constraint. A raw 500 with a
+      // leaked Postgres error message here was a real, live-caught rough
+      // edge -- this is the same clean-error pattern already used for
+      // /auth/signup's UNIQUE(email).
+      if (e.code === '23505') {
+        return res.status(409).json({
+          error: 'a node with this public key is already enrolled -- if it should be a new listing, ' +
+            'retire the old one first (POST /nodes/:id/retire) or generate a fresh identity',
+        });
+      }
+      next(e);
+    }
   });
 
   // Removes a node from "My Machines" / search without deleting the row --
