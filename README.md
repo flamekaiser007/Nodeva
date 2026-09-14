@@ -852,6 +852,30 @@ Phase 1, early. What exists and is tested:
   secret genuinely stops working once the rotation is declared complete,
   for both JWT_SECRET and ADMIN_TOKEN.
 
+- **Horizontal scaling, actually validated under concurrency.**
+  `ws/clusterRelay.js` (cross-instance Hub routing over Redis) has existed
+  since earlier in this project and been unit-tested with fake sockets,
+  but never run as more than one real OS process at a time. Adds
+  `scripts/scale_demo.sh`: THREE real, independent backend processes
+  sharing one real Postgres and one real Redis, one real worker connected
+  to only ONE of the three, and a real buyer firing 9 concurrent booking
+  attempts for the identical slot round-robined across all three
+  instances. Instances that don't hold the worker's live socket can only
+  reach it by relaying the request over Redis -- this is the actual
+  property under test, not raw throughput (a benchmark run wasn't the
+  point; a race condition in the relay's request/reply correlation under
+  real concurrent cross-process traffic was).
+
+  Verified live: exactly 1 of the 9 concurrent cross-instance attempts for
+  the same slot succeeded (the GiST exclusion constraint's own guarantee,
+  now proven to survive being routed through 3 separate processes instead
+  of one), confirmed both via the HTTP responses and by counting the
+  actual row in Postgres afterward, and a separate batch of 6
+  non-overlapping bookings spread across all 3 instances all succeeded
+  concurrently with no corruption. No source changes were needed --
+  clusterRelay.js's existing design held up under a real multi-process
+  test it had not previously been run against.
+
 ## Running
 
 ```bash
