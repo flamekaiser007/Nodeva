@@ -3,9 +3,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
+import nodeva_worker.hardware as hardware_module
 from nodeva_worker.hardware import (
     detect_gpus, offerable_vram_mb, NoGpu, _parse_int, GpuInfo,
-    detect_cpu_cores, detect_ram_mb,
+    detect_cpu_cores, detect_ram_mb, describe_this_machine,
 )
 
 # Real nvidia-smi --format=csv,noheader,nounits output shapes.
@@ -96,3 +97,54 @@ def test_detect_ram_mb_returns_none_when_sysconf_is_unavailable():
 def test_detect_ram_mb_returns_none_on_nonsensical_values():
     assert detect_ram_mb(_sysconf=lambda name: 0) is None
     assert detect_ram_mb(_sysconf=lambda name: -1) is None
+
+
+# --- describe_this_machine ---------------------------------------------
+# What the CLI snippet ProviderDashboard.jsx prints actually calls -- a
+# real, live-caught UX gap: the snippet used to print ONLY the public key,
+# so a provider had no way to get GPU model/VRAM/cores/RAM other than
+# typing them in by hand and guessing. This is the single function that
+# closes that gap; wrong output here means the enrollment form silently
+# gets fed wrong numbers.
+
+def test_describe_this_machine_reports_a_real_gpu(monkeypatch):
+    monkeypatch.setattr(
+        hardware_module, "detect_gpus",
+        lambda: [GpuInfo("NVIDIA GeForce RTX 4090", 24564, 1832, 31, 47, 371, "550.54.14")])
+    monkeypatch.setattr(hardware_module, "detect_cpu_cores", lambda: 16)
+    monkeypatch.setattr(hardware_module, "detect_ram_mb", lambda: 32768)
+
+    info = describe_this_machine()
+    assert info == {
+        "gpu_model": "NVIDIA GeForce RTX 4090",
+        "gpu_vram_gb": 24,  # 24564 MB rounds to 24 GB, matching the form's GB unit
+        "cpu_cores": 16,
+        "ram_gb": 32,
+    }
+
+
+def test_describe_this_machine_reports_none_for_gpu_fields_on_a_cpu_only_node(monkeypatch):
+    # None, not 0 -- a CPU-only node genuinely has no GPU to report, which
+    # is a different claim than "0 GB of VRAM" (a form value that would
+    # fail compute_nodes' own CHECK (gpu_vram_mb > 0) constraint anyway).
+    def no_gpu():
+        raise NoGpu("nvidia-smi not found on PATH")
+    monkeypatch.setattr(hardware_module, "detect_gpus", no_gpu)
+    monkeypatch.setattr(hardware_module, "detect_cpu_cores", lambda: 8)
+    monkeypatch.setattr(hardware_module, "detect_ram_mb", lambda: 16384)
+
+    info = describe_this_machine()
+    assert info["gpu_model"] is None
+    assert info["gpu_vram_gb"] is None
+    assert info["cpu_cores"] == 8
+    assert info["ram_gb"] == 16
+
+
+def test_describe_this_machine_reports_none_ram_when_genuinely_unknown(monkeypatch):
+    monkeypatch.setattr(hardware_module, "detect_gpus", lambda: (_ for _ in ()).throw(NoGpu("none")))
+    monkeypatch.setattr(hardware_module, "detect_cpu_cores", lambda: None)
+    monkeypatch.setattr(hardware_module, "detect_ram_mb", lambda: None)
+
+    info = describe_this_machine()
+    assert info["cpu_cores"] is None
+    assert info["ram_gb"] is None

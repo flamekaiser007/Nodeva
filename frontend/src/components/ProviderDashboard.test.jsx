@@ -46,7 +46,7 @@ test('submitting without filling in the numeric fields is blocked, not silently 
   render(<ProviderDashboard />)
   fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
 
-  fireEvent.change(screen.getByPlaceholderText('public key (64 hex characters)'), {
+  fireEvent.change(screen.getByPlaceholderText("paste the command's output here"), {
     target: { value: 'a'.repeat(64) },
   })
   fireEvent.click(screen.getByRole('button', { name: /enroll this machine/i }))
@@ -63,7 +63,7 @@ test('a fully filled-in form submits the exact typed values, correctly converted
   render(<ProviderDashboard />)
   fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
 
-  fireEvent.change(screen.getByPlaceholderText('public key (64 hex characters)'), { target: { value: 'b'.repeat(64) } })
+  fireEvent.change(screen.getByPlaceholderText("paste the command's output here"), { target: { value: 'b'.repeat(64) } })
   fireEvent.change(screen.getByLabelText('GPU model'), { target: { value: 'RTX 3080' } })
   fireEvent.change(screen.getByLabelText('VRAM (GB)'), { target: { value: '10' } })
   fireEvent.change(screen.getByLabelText('CPU cores'), { target: { value: '8' } })
@@ -80,4 +80,64 @@ test('a fully filled-in form submits the exact typed values, correctly converted
     ram_mb: 16 * 1024,
     price_paise_hr: 2550,
   })
+})
+
+// Regression coverage for the follow-up gap: pasting a bare hex string
+// used to be the ONLY thing this field accepted, leaving GPU
+// model/VRAM/cores/RAM to be typed in by hand and guessed. The CLI
+// snippet now prints a JSON blob (worker/nodeva_worker/hardware.py's
+// describe_this_machine) instead of a bare hex string; pasting the WHOLE
+// blob should auto-fill everything it detected.
+test('pasting the JSON blob from the CLI snippet auto-fills the detected fields', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithNoNodes())
+  render(<ProviderDashboard />)
+  fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
+
+  const blob = JSON.stringify({
+    public_key_hex: 'c'.repeat(64),
+    gpu_model: 'NVIDIA GeForce RTX 4090',
+    gpu_vram_gb: 24,
+    cpu_cores: 16,
+    ram_gb: 32,
+  })
+  fireEvent.change(screen.getByPlaceholderText("paste the command's output here"), { target: { value: blob } })
+
+  // The field itself collapses down to just the extracted public key --
+  // that's what actually gets submitted, not the raw JSON text.
+  expect(screen.getByPlaceholderText("paste the command's output here")).toHaveValue('c'.repeat(64))
+  expect(screen.getByLabelText('GPU model')).toHaveValue('NVIDIA GeForce RTX 4090')
+  expect(screen.getByLabelText('VRAM (GB)')).toHaveValue(24)
+  expect(screen.getByLabelText('CPU cores')).toHaveValue(16)
+  expect(screen.getByLabelText('RAM (GB)')).toHaveValue(32)
+  expect(screen.getByText(/detected from your machine/i)).toBeInTheDocument()
+})
+
+test('pasting a JSON blob for a CPU-only node (null GPU fields) leaves GPU fields for manual entry', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithNoNodes())
+  render(<ProviderDashboard />)
+  fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
+
+  const blob = JSON.stringify({
+    public_key_hex: 'd'.repeat(64),
+    gpu_model: null, gpu_vram_gb: null, // NoGpu, per hardware.py's honest-unknown posture
+    cpu_cores: 8, ram_gb: 16,
+  })
+  fireEvent.change(screen.getByPlaceholderText("paste the command's output here"), { target: { value: blob } })
+
+  expect(screen.getByLabelText('GPU model')).toHaveValue('') // still empty -- nothing to auto-fill, not a fabricated value
+  expect(screen.getByLabelText('VRAM (GB)')).toHaveValue(null)
+  expect(screen.getByLabelText('CPU cores')).toHaveValue(8)
+  expect(screen.getByLabelText('RAM (GB)')).toHaveValue(16)
+})
+
+test('pasting a bare hex string (not JSON) still works exactly as before', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithNoNodes())
+  render(<ProviderDashboard />)
+  fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
+
+  fireEvent.change(screen.getByPlaceholderText("paste the command's output here"), { target: { value: 'e'.repeat(64) } })
+
+  expect(screen.getByPlaceholderText("paste the command's output here")).toHaveValue('e'.repeat(64))
+  expect(screen.getByLabelText('GPU model')).toHaveValue('') // nothing to auto-fill from a bare string
+  expect(screen.queryByText(/detected from your machine/i)).not.toBeInTheDocument()
 })

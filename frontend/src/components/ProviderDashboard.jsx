@@ -267,6 +267,32 @@ function EnrollNodeForm({ onEnrolled }) {
   const [price, setPrice] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+  const [detected, setDetected] = useState(null) // which fields the pasted JSON actually filled in, for the confirmation note below
+
+  // The CLI snippet below prints a JSON blob (public key + real detected
+  // hardware, see worker/nodeva_worker/hardware.py's describe_this_machine)
+  // instead of a bare hex string. Pasting the whole blob here auto-fills
+  // the fields it could detect; pasting a bare hex string (or a GPU-less
+  // node reporting nulls for those fields) still works exactly as before
+  // -- this only ever ADDS values, never blocks manual entry or overrides
+  // something the provider already typed for a field.
+  function handlePaste(raw) {
+    setPubKey(raw)
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return // not JSON -- treat as a bare public key, nothing else to fill
+    }
+    if (!parsed.public_key_hex) return
+    setPubKey(parsed.public_key_hex)
+    const filled = []
+    if (parsed.gpu_model) { setGpuModel(parsed.gpu_model); filled.push('GPU model') }
+    if (parsed.gpu_vram_gb != null) { setVram(String(parsed.gpu_vram_gb)); filled.push('VRAM') }
+    if (parsed.cpu_cores != null) { setCores(String(parsed.cpu_cores)); filled.push('CPU cores') }
+    if (parsed.ram_gb != null) { setRam(String(parsed.ram_gb)); filled.push('RAM') }
+    setDetected(filled)
+  }
 
   async function submit(e) {
     e.preventDefault()
@@ -291,20 +317,31 @@ function EnrollNodeForm({ onEnrolled }) {
   return (
     <form onSubmit={submit} className="grid gap-3 rounded-lg border border-neutral-200 bg-white p-4">
       <p className="text-xs text-neutral-500">
-        Run the Compute Worker on the machine you're sharing and paste its public
-        key below (the worker generates and keeps the private key -- it never
-        leaves that machine):
+        Run the Compute Worker on the machine you're sharing and paste its
+        output below (the worker generates and keeps the private key -- it
+        never leaves that machine). This also detects and fills in your
+        real GPU model, VRAM, CPU cores, and RAM below, so you don't have
+        to type them in by hand:
       </p>
       <pre className="overflow-x-auto rounded bg-neutral-900 p-2 text-xs text-neutral-100">
 {`python -c "
+import json
 from pathlib import Path
 from nodeva_worker.identity import NodeIdentity
-print(NodeIdentity.load_or_create(Path('~/.nodeva/node.pem')).public_key_raw().hex())
+from nodeva_worker.hardware import describe_this_machine
+ident = NodeIdentity.load_or_create(Path('~/.nodeva/node.pem'))
+print(json.dumps({'public_key_hex': ident.public_key_raw().hex(), **describe_this_machine()}))
 "`}
       </pre>
-      <input required placeholder="public key (64 hex characters)" value={pubKey}
-        onChange={(e) => setPubKey(e.target.value)}
+      <input required placeholder="paste the command's output here" value={pubKey}
+        onChange={(e) => handlePaste(e.target.value)}
         className="rounded border border-neutral-300 px-2 py-1 font-mono text-sm" />
+      {detected?.length > 0 && (
+        <p className="text-xs text-emerald-700">
+          ✓ Detected from your machine: {detected.join(', ')}. Double-check
+          below before enrolling.
+        </p>
+      )}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <LabeledInput label="GPU model" value={gpuModel} onChange={setGpuModel} placeholder="e.g. RTX 4090" required />
         <LabeledInput label="VRAM (GB)" type="number" value={vram} onChange={setVram} placeholder="e.g. 24" required />

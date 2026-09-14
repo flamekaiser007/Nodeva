@@ -134,6 +134,37 @@ def detect_ram_mb(_sysconf=None) -> int | None:
     return (page_size * phys_pages) // (1024 * 1024)
 
 
+def describe_this_machine() -> dict:
+    """Everything the platform's node-enrollment form asks for (GPU model,
+    VRAM, CPU cores, RAM), detected from THIS machine -- printed by the CLI
+    snippet the frontend shows a provider (ProviderDashboard.jsx) so they
+    can paste one blob instead of typing four numbers by hand and guessing
+    (or, worse, leaving a stale/wrong value that immediately shows up as a
+    hardware_mismatch on their own dashboard).
+
+    Still purely a convenience, not a security boundary -- see this file's
+    own header. A dishonest operator controls this exact code and can
+    report whatever they want; what changes here is that an HONEST
+    provider no longer has to manually transcribe numbers `nvidia-smi` or
+    `free` would tell them anyway.
+
+    GPU fields are None on a CPU-only node (NoGpu) or when nvidia-smi
+    itself isn't reachable -- exactly the same honest-unknown posture
+    detect_cpu_cores/detect_ram_mb already use, not a value of 0."""
+    try:
+        gpu = detect_gpus()[0]
+        gpu_model, gpu_vram_gb = gpu.model, round(gpu.vram_total_mb / 1024)
+    except NoGpu:
+        gpu_model, gpu_vram_gb = None, None
+    ram_mb = detect_ram_mb()
+    return {
+        "gpu_model": gpu_model,
+        "gpu_vram_gb": gpu_vram_gb,
+        "cpu_cores": detect_cpu_cores(),
+        "ram_gb": round(ram_mb / 1024) if ram_mb else None,
+    }
+
+
 def offerable_vram_mb(gpu: GpuInfo, headroom_mb: int = 1024) -> int:
     """VRAM we can honestly advertise.
 
