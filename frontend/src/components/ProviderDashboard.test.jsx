@@ -7,6 +7,7 @@ vi.mock('../api', () => ({
     providerDashboard: vi.fn(),
     becomeProvider: vi.fn(),
     enrollNode: vi.fn(),
+    retireNode: vi.fn(),
   },
 }))
 import { api } from '../api'
@@ -140,4 +141,64 @@ test('pasting a bare hex string (not JSON) still works exactly as before', async
   expect(screen.getByPlaceholderText("paste the command's output here")).toHaveValue('e'.repeat(64))
   expect(screen.getByLabelText('GPU model')).toHaveValue('') // nothing to auto-fill from a bare string
   expect(screen.queryByText(/detected from your machine/i)).not.toBeInTheDocument()
+})
+
+// --- removing a machine -------------------------------------------------
+
+function dashboardWithOneNode(overrides = {}) {
+  return {
+    reputation: { jobs_total: 0, reliability: null },
+    earnings: { today_paise: 0, week_paise: 0, month_paise: 0, available_paise: 0 },
+    disputes: [],
+    nodes: [{
+      node_id: 'node-1', gpu_model: 'RTX 4090', gpu_vram_mb: 24576, cpu_cores: 16,
+      ram_mb: 32768, price_paise_hr: 4300, status: 'online', online: true,
+      heartbeat: null, hardware_mismatch: null, ...overrides,
+    }],
+  }
+}
+
+test('clicking Remove asks for confirmation, then calls retireNode and refreshes the dashboard', async () => {
+  api.providerDashboard
+    .mockResolvedValueOnce(dashboardWithOneNode())
+    .mockResolvedValueOnce(dashboardWithNoNodes()) // the refresh after a successful retire
+  api.retireNode.mockResolvedValue({ ok: true })
+  vi.spyOn(window, 'confirm').mockReturnValue(true)
+
+  render(<ProviderDashboard />)
+  expect(await screen.findByText('RTX 4090')).toBeInTheDocument()
+
+  fireEvent.click(screen.getByRole('button', { name: /remove/i }))
+
+  expect(window.confirm).toHaveBeenCalledTimes(1)
+  await waitFor(() => expect(api.retireNode).toHaveBeenCalledWith('node-1'))
+  // The onRetired callback re-fetches the dashboard, which now has no nodes.
+  await waitFor(() => expect(screen.queryByText('RTX 4090')).not.toBeInTheDocument())
+})
+
+test('declining the confirmation does not call retireNode', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithOneNode())
+  vi.spyOn(window, 'confirm').mockReturnValue(false)
+
+  render(<ProviderDashboard />)
+  expect(await screen.findByText('RTX 4090')).toBeInTheDocument()
+
+  fireEvent.click(screen.getByRole('button', { name: /remove/i }))
+
+  expect(api.retireNode).not.toHaveBeenCalled()
+  expect(screen.getByText('RTX 4090')).toBeInTheDocument() // still there
+})
+
+test('a refused retire (409, e.g. a live reservation) shows the real error, not a silent failure', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithOneNode())
+  api.retireNode.mockRejectedValue(Object.assign(new Error('node has a live reservation; wait for it to settle first'), { status: 409 }))
+  vi.spyOn(window, 'confirm').mockReturnValue(true)
+
+  render(<ProviderDashboard />)
+  expect(await screen.findByText('RTX 4090')).toBeInTheDocument()
+
+  fireEvent.click(screen.getByRole('button', { name: /remove/i }))
+
+  expect(await screen.findByText(/live reservation/i)).toBeInTheDocument()
+  expect(screen.getByText('RTX 4090')).toBeInTheDocument() // the node is still listed -- nothing was removed
 })

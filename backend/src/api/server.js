@@ -409,7 +409,9 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
       const nodesResult = await pool.query(
         `SELECT node_id, gpu_model, gpu_vram_mb, cpu_cores, ram_mb, price_paise_hr,
                 status, cuda_version, last_seen_at, created_at
-           FROM compute_nodes WHERE provider_id = $1 ORDER BY created_at DESC`,
+           FROM compute_nodes
+          WHERE provider_id = $1 AND status <> 'draining'
+          ORDER BY created_at DESC`,
         [provider.provider_id]);
       const nodes = nodesResult.rows.map((n) => {
         const hb = heartbeats.get(n.node_id);
@@ -530,6 +532,44 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
         [providerRow.rows[0].provider_id, pub, gpu_model, gpu_vram_mb, cpu_cores, ram_mb,
          price_paise_hr, cuda_version ?? null]);
       res.status(201).json({ node_id: rows[0].node_id });
+    } catch (e) { next(e); }
+  });
+
+  // Removes a node from "My Machines" / search without deleting the row --
+  // compute_nodes is referenced by reservations with ON DELETE RESTRICT
+  // (migrations/001_init.sql), so a real DELETE would either fail outright
+  // once the node has any booking history, or (if it somehow didn't)
+  // silently destroy the audit trail a past dispute/settlement depends on.
+  // 'draining' already existed in the status CHECK constraint from the
+  // very first migration but was never wired to anything -- this is that
+  // wiring. search's own WHERE n.status = 'online' already excludes it, so
+  // no change was needed there; the dashboard query below excludes it from
+  // the list entirely, matching what "delete this machine" actually means
+  // to the person clicking it.
+  app.post('/nodes/:id/retire', auth, async (req, res, next) => {
+    try {
+      const nodeRow = await pool.query(
+        `SELECT n.node_id FROM compute_nodes n
+           JOIN providers p ON p.provider_id = n.provider_id
+          WHERE n.node_id = $1 AND p.user_id = $2`,
+        [req.params.id, req.userId]);
+      if (!nodeRow.rows[0]) return res.status(404).json({ error: 'not_found' });
+
+      // Refuse while a booking on this node is still live -- retiring out
+      // from under an in-progress reservation would strand a paying user
+      // with no way for the node to ever report a result. The provider
+      // can retry once it settles (or fails) normally.
+      const liveReservation = await pool.query(
+        `SELECT 1 FROM reservations
+          WHERE node_id = $1 AND status IN ('pending','held','confirmed','running')
+          LIMIT 1`,
+        [req.params.id]);
+      if (liveReservation.rows[0]) {
+        return res.status(409).json({ error: 'node has a live reservation; wait for it to settle first' });
+      }
+
+      await pool.query("UPDATE compute_nodes SET status = 'draining' WHERE node_id = $1", [req.params.id]);
+      res.json({ ok: true });
     } catch (e) { next(e); }
   });
 

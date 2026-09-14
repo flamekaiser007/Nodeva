@@ -117,7 +117,7 @@ export default function ProviderDashboard() {
       )}
 
       <div className="grid gap-3">
-        {nodes.map((n) => <NodeCard key={n.node_id} node={n} />)}
+        {nodes.map((n) => <NodeCard key={n.node_id} node={n} onRetired={load} />)}
       </div>
     </div>
   )
@@ -179,8 +179,28 @@ function Stat({ label, value }) {
   )
 }
 
-function NodeCard({ node }) {
+function NodeCard({ node, onRetired }) {
   const gpu = node.heartbeat?.gpu
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+
+  async function handleRemove() {
+    // A node with a live reservation is refused server-side (409) rather
+    // than silently orphaning a paying user's in-progress booking -- see
+    // api/server.js's POST /nodes/:id/retire. window.confirm here is a
+    // deliberately cheap guard against a stray click; the real safety
+    // check is the backend's, not this one.
+    if (!window.confirm(`Remove ${node.gpu_model}? This machine will stop appearing to renters.`)) return
+    setBusy(true); setError(null)
+    try {
+      await api.retireNode(node.node_id)
+      onRetired?.()
+    } catch (e) {
+      setError(e.message)
+      setBusy(false)
+    }
+  }
+
   return (
     <div className="rounded-lg border border-neutral-200 bg-white p-4">
       <div className="flex items-center justify-between">
@@ -188,8 +208,15 @@ function NodeCard({ node }) {
           <span className={`h-2 w-2 rounded-full ${node.online ? 'bg-emerald-500' : 'bg-neutral-300'}`} />
           <span className="font-semibold text-neutral-800">{node.gpu_model}</span>
         </div>
-        <span className="text-sm text-neutral-500">{node.online ? 'ONLINE' : 'OFFLINE'}</span>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-neutral-500">{node.online ? 'ONLINE' : 'OFFLINE'}</span>
+          <button onClick={handleRemove} disabled={busy}
+            className="text-xs font-medium text-red-600 hover:underline disabled:opacity-40">
+            {busy ? 'Removing…' : 'Remove'}
+          </button>
+        </div>
       </div>
+      {error && <div className="mt-1 text-xs text-red-600">{error}</div>}
       <div className="mt-1 text-sm text-neutral-500">
         {(node.gpu_vram_mb / 1024).toFixed(0)} GB VRAM · {node.cpu_cores} cores ·{' '}
         {(node.ram_mb / 1024).toFixed(0)} GB RAM · {paise(node.price_paise_hr)}/hr

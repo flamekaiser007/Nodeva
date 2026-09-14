@@ -10,6 +10,7 @@ import crypto from 'node:crypto';
 import { createPool } from '../src/db/pool.js';
 import { createApp } from '../src/api/server.js';
 import { TYPE } from '../src/ws/protocol.js';
+import { encode } from '../src/lib/canonical.js';
 
 const DATABASE_URL = process.env.DATABASE_URL
   ?? 'postgresql://nodeva:nodeva_dev@localhost:5433/nodeva';
@@ -71,6 +72,25 @@ class MinimalWorker {
   }
   heartbeat(msg) {
     this.sock.receive({ type: TYPE.HEARTBEAT, ...msg });
+  }
+  // Opt-in: only the retire-with-a-live-reservation test needs a real
+  // booking to go through, so this installs a persistent RESERVE_REQUEST
+  // handler rather than making every other test in this file pay for one.
+  answerReservationRequests() {
+    this.sock._onSend = (msg) => {
+      if (msg.type !== TYPE.RESERVE_REQUEST) return;
+      const body = {
+        reservation_id: msg.reservation_id, node_id: this.nodeId,
+        starts_at: msg.starts_at, ends_at: msg.ends_at,
+        price_paise_hr: msg.price_paise_hr,
+        hold_expires_at: Date.now() + 120_000, issued_at: Date.now(),
+      };
+      const sig = this.kp.sign(encode(body));
+      this.sock.receive({
+        type: TYPE.RECEIPT, reservation_id: msg.reservation_id,
+        body, signature_hex: sig.toString('hex'),
+      });
+    };
   }
 }
 
@@ -279,3 +299,93 @@ test('a node before its first heartbeat has hardware_mismatch: null, not a false
     const node = body.nodes.find((n) => n.node_id === node_id);
     assert.equal(node.hardware_mismatch, null, 'no data yet must not be reported as a mismatch');
   });
+
+// --- retiring a node (POST /nodes/:id/retire) ---------------------------
+
+test('retiring a node removes it from the dashboard list', { skip }, async () => {
+  const { token } = await signup('Retiring Provider');
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+  const { node_id } = await (await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' },
+    body: JSON.stringify({
+      public_key_hex: crypto.randomBytes(32).toString('hex'), gpu_model: 'RTX 4090',
+      gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+    }),
+  })).json();
+
+  const retireRes = await fetch(`${base}/nodes/${node_id}/retire`, {
+    method: 'POST', headers: authed(token),
+  });
+  assert.equal(retireRes.status, 200);
+
+  const body = await (await fetch(`${base}/providers/me/dashboard`, { headers: authed(token) })).json();
+  assert.equal(body.nodes.find((n) => n.node_id === node_id), undefined,
+    'a retired node must not still show up as one of "my machines"');
+});
+
+test('retiring is idempotent -- the row is never deleted, just marked draining', { skip }, async () => {
+  const { token } = await signup('Idempotent Retire Provider');
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+  const { node_id } = await (await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' },
+    body: JSON.stringify({
+      public_key_hex: crypto.randomBytes(32).toString('hex'), gpu_model: 'RTX 4090',
+      gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+    }),
+  })).json();
+
+  const first = await fetch(`${base}/nodes/${node_id}/retire`, { method: 'POST', headers: authed(token) });
+  const second = await fetch(`${base}/nodes/${node_id}/retire`, { method: 'POST', headers: authed(token) });
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200, 'retiring an already-retired node must not error');
+
+  const row = await pool.query('SELECT status FROM compute_nodes WHERE node_id=$1', [node_id]);
+  assert.equal(row.rows[0].status, 'draining', 'the row itself survives -- never a real DELETE');
+});
+
+test('a provider cannot retire another provider\'s node', { skip }, async () => {
+  const a = await signup('Retire Owner A');
+  const b = await signup('Retire Attacker B');
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(a.token) });
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(b.token) });
+  const { node_id } = await (await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(a.token), 'content-type': 'application/json' },
+    body: JSON.stringify({
+      public_key_hex: crypto.randomBytes(32).toString('hex'), gpu_model: 'RTX 4090',
+      gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+    }),
+  })).json();
+
+  const res = await fetch(`${base}/nodes/${node_id}/retire`, { method: 'POST', headers: authed(b.token) });
+  assert.equal(res.status, 404, 'hide existence from a non-owner, same as every other ownership check in this file');
+
+  const stillThere = await (await fetch(`${base}/providers/me/dashboard`, { headers: authed(a.token) })).json();
+  assert.ok(stillThere.nodes.find((n) => n.node_id === node_id), "the real owner's node must be untouched");
+});
+
+test('retiring a node with a live reservation is refused, not silently orphaning a booking', { skip }, async () => {
+  const buyer = await signup('Retire Buyer');
+  const { token: providerToken } = await signup('Retire Provider With Live Reservation');
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(providerToken) });
+  const { node_id, worker } = await enrollAndConnect(providerToken, {
+    gpu_model: 'RTX 4090', gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+  });
+  worker.answerReservationRequests();
+
+  const startsAt = Date.UTC(2033, 0, 1, 10, 0);
+  const endsAt = startsAt + 3_600_000;
+  const reserveRes = await (await fetch(`${base}/reservations`, {
+    method: 'POST', headers: { ...authed(buyer.token), 'content-type': 'application/json' },
+    body: JSON.stringify({ node_id, starts_at: startsAt, ends_at: endsAt }),
+  })).json();
+  assert.ok(reserveRes.reservation_id, 'the booking must have genuinely gone through for this test to mean anything');
+
+  const retireRes = await fetch(`${base}/nodes/${node_id}/retire`, {
+    method: 'POST', headers: authed(providerToken),
+  });
+  assert.equal(retireRes.status, 409);
+
+  const dash = await (await fetch(`${base}/providers/me/dashboard`, { headers: authed(providerToken) })).json();
+  assert.ok(dash.nodes.find((n) => n.node_id === node_id), 'must still be listed -- the retire was refused');
+  worker.sock.close();
+});

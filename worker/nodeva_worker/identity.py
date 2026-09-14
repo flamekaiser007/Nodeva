@@ -28,7 +28,19 @@ class NodeIdentity:
 
     @classmethod
     def load_or_create(cls, path: Path) -> "NodeIdentity":
-        path = Path(path)
+        # `.expanduser()` is required here -- pathlib does NOT expand a
+        # leading `~` on its own (`Path('~/x')` is a literal path segment
+        # named `~` under the current working directory, not $HOME). A
+        # real, live-caught bug: every doc and every UI-printed CLI
+        # snippet in this project passes exactly `Path('~/.nodeva/node.pem')`,
+        # so without this, a provider running that command from a
+        # different working directory each time got a BRAND NEW random
+        # identity every time instead of one stable one -- silently, with
+        # no error, since a missing file is exactly what "create a new
+        # key" already handles. That defeats the entire point of a
+        # long-lived node identity (docs/reservation-protocol.md's
+        # signed-receipt trust model assumes ONE stable key per node).
+        path = Path(path).expanduser()
         if path.exists():
             # Refuse to use a key other users on the box can read. On a shared
             # workstation this is the difference between a node identity and a

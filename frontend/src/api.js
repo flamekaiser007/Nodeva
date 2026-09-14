@@ -108,6 +108,12 @@ export const api = {
 
   enrollNode: (node) => request('/nodes', { method: 'POST', body: JSON.stringify(node) }),
 
+  // Marks a node 'draining' (never a real delete -- compute_nodes rows are
+  // referenced by past reservations with ON DELETE RESTRICT). Refused with
+  // 409 while the node has a live reservation, so a provider can't strand
+  // a paying user's in-progress booking.
+  retireNode: (nodeId) => request(`/nodes/${nodeId}/retire`, { method: 'POST' }),
+
   addAvailability: (nodeId, window_start, window_end) =>
     request(`/nodes/${nodeId}/availability`, {
       method: 'POST', body: JSON.stringify({ window_start, window_end }),
