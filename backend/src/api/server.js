@@ -828,17 +828,25 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   // by onJobResult once a real job actually finishes -- one settlement path,
   // not two copies that could drift apart.
   // MANUAL settlement override -- exists for driving the money side of the
-  // pipeline without a real job (see scripts/e2e_demo.sh's fallback path,
-  // and the tests that predate job execution entirely). This is NOT safe to
-  // expose to arbitrary users in production as-is: a user could call it with
-  // outcome='failed_provider' on their own reservation to claim a refund for
-  // work that actually ran and succeeded, with nothing checking that against
-  // reality the way onJobResult's automatic path does (it settles based on
-  // what the sandboxed executor actually observed, not on a client's say-so).
-  // Ownership is enforced here so at least a user cannot settle someone
-  // ELSE's reservation; a real product should retire this endpoint or gate
-  // it to admin/support roles once job execution is the only settlement path.
+  // pipeline without a real job (see scripts/e2e_demo.sh's fallback path
+  // for when Docker isn't available, and tests written before job
+  // execution existed at all). Ownership alone does NOT make this safe to
+  // expose to arbitrary users: a user could call it with
+  // outcome='failed_provider' on their own reservation to claim a refund
+  // for work that actually ran and succeeded, with nothing checking that
+  // against reality the way onJobResult's automatic path does (it settles
+  // based on what the sandboxed executor actually observed, not a
+  // client's say-so). There is no admin/support role system in this
+  // codebase to gate it behind instead, so the honest fix available now is
+  // the same pattern used elsewhere for dev/test-only surfaces
+  // (UnconfiguredGateway, ConsoleEmailSender): off by default, explicit
+  // opt-in via ALLOW_MANUAL_SETTLEMENT, 404 rather than 403 when disabled
+  // so a prober cannot even confirm the route exists. A real deployment
+  // leaves this unset; e2e_demo.sh and any test relying on it set it
+  // explicitly.
+  const manualSettlementAllowed = process.env.ALLOW_MANUAL_SETTLEMENT === 'true';
   app.post('/reservations/:id/complete', auth, async (req, res, next) => {
+    if (!manualSettlementAllowed) return res.status(404).json({ error: 'not_found' });
     try {
       const owned = await pool.query(
         'SELECT 1 FROM reservations WHERE reservation_id = $1 AND user_id = $2',

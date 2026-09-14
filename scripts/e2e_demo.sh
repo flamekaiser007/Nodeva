@@ -56,7 +56,7 @@ echo "== starting backend =="
 # secret across restarts.
 JWT_SECRET=$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
 ( cd backend && exec env DATABASE_URL="postgresql://nodeva:nodeva_dev@localhost:5433/nodeva" \
-    JWT_SECRET="$JWT_SECRET" PORT=3100 node src/index.js ) > "$BACKEND_LOG" 2>&1 &
+    JWT_SECRET="$JWT_SECRET" PORT=3100 ALLOW_MANUAL_SETTLEMENT=true node src/index.js ) > "$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 for i in $(seq 1 20); do curl -sf http://localhost:3100/health >/dev/null 2>&1 && break; sleep 0.5; done
 curl -sf http://localhost:3100/health >/dev/null || { echo "backend failed to start"; cat "$BACKEND_LOG"; exit 1; }
