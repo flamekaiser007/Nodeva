@@ -41,13 +41,8 @@ jobs:
         working-directory: backend
         run: npm install
       - name: Apply migrations
-        # No migrate.js exists yet -- this mirrors scripts/e2e_demo.sh's own
-        # approach (raw psql against each migration file in order) rather
-        # than inventing a second, divergent way to set up the schema.
-        run: |
-          for f in backend/migrations/*.sql; do
-            PGPASSWORD=nodeva_dev psql -h localhost -p 5433 -U nodeva -d nodeva -v ON_ERROR_STOP=1 -f "$f"
-          done
+        working-directory: backend
+        run: npm run migrate
       - name: Run backend test suite
         working-directory: backend
         run: npm test

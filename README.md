@@ -460,6 +460,26 @@ Phase 1, early. What exists and is tested:
   fresh dispute appears under `awaiting_tiebreak` and moves out of it once
   actually resolved. Full suite is now 231 tests.
 
+- **A real `npm run migrate`** -- `package.json` had referenced it since
+  the first commit, but `backend/src/db/migrate.js` never existed;
+  `scripts/e2e_demo.sh` and CI instead reapplied every migration file with
+  raw psql against a freshly dropped schema every run, which only worked
+  because those two call sites always start from nothing and neither
+  tracks which migrations already ran. `migrate.js` tracks applied
+  migrations in a `schema_migrations` table and only runs what's pending,
+  each file in its own transaction -- the thing an actual deployment (not
+  a from-scratch demo) needs. `e2e_demo.sh` and CI now both call it
+  instead of the raw-psql loop, so there's one path that applies
+  migrations, not two that could drift.
+
+  Tested against a real Postgres in a throwaway schema per test (not
+  `public`, which the rest of the suite's app instances depend on):
+  in-order application, a second run applying nothing, a later-added file
+  being the only one that runs, and -- the case raw psql's
+  `ON_ERROR_STOP=1` never really covered -- a failing migration rolling
+  back and stopping before any later file is even attempted. Full suite
+  is now 236 tests.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.
