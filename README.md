@@ -803,6 +803,28 @@ Phase 1, early. What exists and is tested:
   carrying a unique marker in a custom `x-request-id` header -- and that
   exact line was queried back out of a real Loki container afterward.
 
+- **Backup and restore, with the gaps written down instead of assumed
+  away.** `scripts/db_backup.sh` (a real `pg_dump -Fc`) and
+  `scripts/db_restore.sh` (drop-and-`pg_restore`, asks for explicit
+  confirmation unless passed `-y` -- this is one of the more dangerous
+  commands in the repo) are the first pieces of an actual DR story. See
+  `docs/backup-restore.md` for the full runbook and, more importantly, the
+  HONEST LIMIT section: this backs up to a local file, which does not
+  survive the disk failure DR actually exists for, has no schedule, no
+  retention policy, and no point-in-time recovery (WAL archiving). Writing
+  that down now is better than someone discovering it during an actual
+  incident.
+
+  Verified live via `scripts/backup_restore_demo.sh`: real data created
+  through the real HTTP API (a real user, provider, node), backed up,
+  the schema genuinely DROPPED (not just some rows deleted) to simulate a
+  real disaster, restored, and the exact same rows confirmed back --
+  checked both directly in Postgres and by reading them back out through
+  `GET /providers/me/dashboard` on the same, unrestarted backend
+  connection pool, which is the check that actually matters (a database
+  being queryable and an application correctly serving requests off it are
+  different claims).
+
 ## Running
 
 ```bash

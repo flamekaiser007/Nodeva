@@ -23,5 +23,11 @@ coverage/
 *.sqlite-wal
 worker-state/
 
+# database backups (scripts/db_backup.sh) -- real dumps of a real local
+# database, potentially containing real user data; never something to
+# commit. A real deployment ships these to S3/GCS, not git (see
+# docs/backup-restore.md).
+backups/
+
 # os
 .DS_Store
