@@ -14,7 +14,22 @@
 // index.js) without attempting to rewrite every log line in the codebase
 // in one pass.
 
+import { createLokiSink } from './lokiSink.js';
+
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+
+// Off by default -- read once at module load, same posture as
+// ALLOW_MANUAL_SETTLEMENT/ADMIN_TOKEN/REDIS_URL elsewhere in this project.
+// Every existing test runs with LOKI_URL unset, so this is a no-op for all
+// of them; see lokiSink.test.js for the sink itself and
+// scripts/log_aggregation_demo.sh for a real Loki container actually
+// receiving these lines.
+const lokiSink = process.env.LOKI_URL
+  ? createLokiSink({
+    url: process.env.LOKI_URL,
+    onError: (e) => process.stderr.write(`[logger] failed to ship logs to Loki: ${e.message}\n`),
+  })
+  : null;
 
 // LOG_LEVEL defaults to 'info' -- debug-level detail (none emitted yet at
 // call sites, but the threshold exists so adding some later doesn't
@@ -33,6 +48,7 @@ function write(stream, level, msg, fields) {
     ...fields,
   });
   stream.write(line + '\n');
+  lokiSink?.push(line);
 }
 
 /** Creates a logger. `fields` are attached to every line this instance (or

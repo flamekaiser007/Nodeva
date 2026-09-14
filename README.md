@@ -772,6 +772,37 @@ Phase 1, early. What exists and is tested:
   real `NodevaBackendDown` alert travel Prometheus -> Alertmanager ->
   webhook, landing a real JSON payload at the receiver.
 
+- **Log aggregation: the structured logs actually go somewhere now.**
+  `observability/logger.js`'s JSON lines have gone to stdout/stderr only
+  since the structured-logging work -- real for local dev, useless the
+  moment a process restarts or runs on a different box. Adds
+  `observability/lokiSink.js`, an optional Grafana Loki push-API client
+  (batched, flushed on a timer, using the platform's built-in `fetch`
+  rather than a new HTTP dependency -- the same stdlib-first reasoning as
+  `worker/hardware.py`'s nvidia-smi-over-NVML-binding choice). Off by
+  default: unset `LOKI_URL` and every line still goes only to
+  stdout/stderr, byte-identical to before this existed. Wired into
+  `logger.js`'s single `write()` function, so every existing call site
+  ships automatically with no per-call-site change.
+
+  A failed push (Loki down, network blip) calls `onError` and is DROPPED,
+  not retried -- logs are a best-effort observability signal, not the
+  durable record `payments/refunds.js`'s retry queue exists for, and a
+  logging feature must never become a new way for the backend itself to
+  fail. `docker-compose.yml` gains a `loki` service under the same
+  `observability` profile as prometheus/alertmanager -- the stock image's
+  baked-in default config is enough for local dev, no mounted config file
+  needed.
+
+  7 new unit tests against a fake `fetch` (batching, the maxBatch
+  auto-flush, a non-ok response, and a thrown network exception, all
+  proven not to crash the caller). Backend suite is now 283 tests. Verified
+  live via `scripts/log_aggregation_demo.sh`: a real backend process (real
+  `LOKI_URL`) shipped a real log line -- triggered by a deliberately
+  malformed JSON request body reaching the real top-level error handler,
+  carrying a unique marker in a custom `x-request-id` header -- and that
+  exact line was queried back out of a real Loki container afterward.
+
 ## Running
 
 ```bash

@@ -50,5 +50,16 @@ services:
       - ./alerting/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
 
+  # Log aggregation (observability/lokiSink.js): the backend ships its
+  # structured JSON lines here directly over Loki's HTTP push API when
+  # LOKI_URL is set (off by default, same posture as everything else in
+  # this profile). The stock image's baked-in default config
+  # (/etc/loki/local-config.yaml, filesystem storage) is enough for local
+  # dev -- no mounted config needed, unlike prometheus/alertmanager above.
+  loki:
+    image: grafana/loki:2.9.10
+    profiles: ["observability"]
+    ports: ["3300:3100"] # host 3300, not 3100 -- the backend itself already owns 3100 locally
+
 volumes:
   pgdata:
