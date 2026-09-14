@@ -517,6 +517,34 @@ Phase 1, early. What exists and is tested:
   actual browser. Worker suite is now 48 tests (+8), backend suite 240
   (+4).
 
+- **A real frontend test suite.** Every UI claim in this project had been
+  verified live in a browser -- valuable, but not repeatable, and exactly
+  the kind of gap that let the `VerifiedPairReservation` remount bug ship
+  in the first place (nothing would have caught a regression of it
+  automatically). Added Vitest + React Testing Library
+  (`frontend/vitest.config.js`, `npm test`) and 30 real component tests
+  across the components with actual async/state complexity:
+  `VerifiedPairReservation` (6 tests, including a direct regression test
+  for the remount-hydration bug and the in-flight-job-recovery polling
+  path using fake timers), `ActiveReservation` (5, including job-polling
+  stop conditions), `ResultsList` (9, the partner-picking state machine),
+  `DisputeResolution` (5, resolution states and the full tiebreaker flow
+  search→reserve→confirm→submit→resolved), and `confirmPayment` (5, every
+  Razorpay Checkout callback path -- success, dismiss, payment.failed,
+  rejected signature -- against a fake `window.Razorpay` constructor, no
+  live account needed). All mock `../api`/`../lib/confirmPayment` at the
+  module boundary rather than real fetch calls, matching where this
+  project's own trust boundary already sits.
+
+  One real, non-project bug surfaced while wiring this up: `npm install`
+  hit an npm/arborist crash (`Cannot read properties of null (reading
+  'edgesOut')`) resolving vitest's peer tree on this machine's npm
+  version -- a bug in npm's resolver, not a conflict in this project's
+  dependencies. Worked around with `frontend/.npmrc`'s
+  `legacy-peer-deps=true`, documented in place so the reason doesn't get
+  rediscovered the hard way later. CI's frontend job now runs `npm test`
+  between lint and build.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.

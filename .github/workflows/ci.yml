@@ -1,13 +1,13 @@
 name: CI
 
-# Runs the same three suites this project has relied on for real
-# verification throughout its history -- backend (real Postgres, no
-# mocked DB), worker (real Docker, self-skipping if unavailable), and
-# frontend build+lint -- on every push and pull request. Nothing here
-# invents a new testing strategy; it just runs what already exists in
-# CLAUDE-session history under scripts/e2e_demo.sh and each package's own
-# test script, so a regression is caught before merge instead of only
-# when someone remembers to run tests locally.
+# Runs the same three suites this project relies on for real verification
+# -- backend (real Postgres, no mocked DB), worker (real Docker,
+# self-skipping if unavailable), and frontend (Vitest + Testing Library
+# component tests, lint, build) -- on every push and pull request. Nothing
+# here invents a new testing strategy; it just runs what already exists
+# under scripts/e2e_demo.sh and each package's own test script, so a
+# regression is caught before merge instead of only when someone
+# remembers to run tests locally.
 on:
   push:
     branches: [main, master]
@@ -77,6 +77,9 @@ jobs:
       - name: Lint
         working-directory: frontend
         run: npm run lint
+      - name: Run frontend test suite
+        working-directory: frontend
+        run: npm test
       - name: Build
         working-directory: frontend
         run: npm run build
