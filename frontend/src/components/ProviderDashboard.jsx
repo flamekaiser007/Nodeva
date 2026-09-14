@@ -251,11 +251,20 @@ function HardwareMismatchNotice({ mismatches }) {
 
 function EnrollNodeForm({ onEnrolled }) {
   const [pubKey, setPubKey] = useState('')
-  const [gpuModel, setGpuModel] = useState('RTX 4090')
-  const [vram, setVram] = useState(24)
-  const [cores, setCores] = useState(16)
-  const [ram, setRam] = useState(32)
-  const [price, setPrice] = useState(43)
+  // Empty, not pre-filled with a plausible-looking example -- these used to
+  // default to 'RTX 4090' / 24 / 16 / 32 / 43, real values a provider could
+  // submit by clicking "Enroll" without touching a single field. That's
+  // exactly the failure mode api/server.js's checkHardwareMismatch exists
+  // to catch (a node's DECLARED specs not matching what its own worker
+  // heartbeat later reports), except here the form itself was the thing
+  // inviting a mismatch, not provider dishonesty. See LabeledInput's
+  // `placeholder` for where the example values still live, correctly
+  // grayed-out and never submitted unless typed.
+  const [gpuModel, setGpuModel] = useState('')
+  const [vram, setVram] = useState('')
+  const [cores, setCores] = useState('')
+  const [ram, setRam] = useState('')
+  const [price, setPrice] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
 
@@ -266,10 +275,10 @@ function EnrollNodeForm({ onEnrolled }) {
       await api.enrollNode({
         public_key_hex: pubKey.trim(),
         gpu_model: gpuModel,
-        gpu_vram_mb: vram * 1024,
-        cpu_cores: cores,
-        ram_mb: ram * 1024,
-        price_paise_hr: Math.round(price * 100),
+        gpu_vram_mb: Number(vram) * 1024,
+        cpu_cores: Number(cores),
+        ram_mb: Number(ram) * 1024,
+        price_paise_hr: Math.round(Number(price) * 100),
       })
       onEnrolled()
     } catch (e) {
@@ -297,12 +306,12 @@ print(NodeIdentity.load_or_create(Path('~/.nodeva/node.pem')).public_key_raw().h
         onChange={(e) => setPubKey(e.target.value)}
         className="rounded border border-neutral-300 px-2 py-1 font-mono text-sm" />
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <LabeledInput label="GPU model" value={gpuModel} onChange={setGpuModel} />
-        <LabeledInput label="VRAM (GB)" type="number" value={vram} onChange={(v) => setVram(+v)} />
-        <LabeledInput label="CPU cores" type="number" value={cores} onChange={(v) => setCores(+v)} />
-        <LabeledInput label="RAM (GB)" type="number" value={ram} onChange={(v) => setRam(+v)} />
+        <LabeledInput label="GPU model" value={gpuModel} onChange={setGpuModel} placeholder="e.g. RTX 4090" required />
+        <LabeledInput label="VRAM (GB)" type="number" value={vram} onChange={setVram} placeholder="e.g. 24" required />
+        <LabeledInput label="CPU cores" type="number" value={cores} onChange={setCores} placeholder="e.g. 16" required />
+        <LabeledInput label="RAM (GB)" type="number" value={ram} onChange={setRam} placeholder="e.g. 32" required />
       </div>
-      <LabeledInput label="Price (₹/hr)" type="number" value={price} onChange={(v) => setPrice(+v)} />
+      <LabeledInput label="Price (₹/hr)" type="number" value={price} onChange={setPrice} placeholder="e.g. 43" required />
       {error && <div className="text-sm text-red-600">{error}</div>}
       <button disabled={busy}
         className="rounded bg-neutral-800 px-4 py-2 font-medium text-white hover:bg-neutral-900 disabled:opacity-50">
@@ -312,11 +321,12 @@ print(NodeIdentity.load_or_create(Path('~/.nodeva/node.pem')).public_key_raw().h
   )
 }
 
-function LabeledInput({ label, value, onChange, type = 'text' }) {
+function LabeledInput({ label, value, onChange, type = 'text', placeholder, required }) {
   return (
     <label className="text-sm">
       <span className="font-medium text-neutral-600">{label}</span>
       <input type={type} value={value} onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder} required={required}
         className="mt-1 w-full rounded border border-neutral-300 px-2 py-1" />
     </label>
   )
