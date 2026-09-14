@@ -876,6 +876,46 @@ Phase 1, early. What exists and is tested:
   clusterRelay.js's existing design held up under a real multi-process
   test it had not previously been run against.
 
+- **Real-browser E2E tests, and a documentation pass.** Every prior
+  frontend test mocked `../api`; nothing had ever driven the actual
+  rendered UI in a real browser against a real backend. Adds `e2e/`
+  (Playwright + real Chromium) and `e2e/run_e2e.sh`, which boots a real
+  Postgres, backend, and Python worker, starts the real Vite dev server,
+  and runs the browser through the full golden path -- sign up, search,
+  reserve, confirm & pay (no live gateway configured), submit a job, and
+  wait for a REAL Docker container's real stdout to render in the page.
+
+  This immediately caught a real, live bug that no mocked component test
+  could have: `SearchForm.jsx`'s default search window was computed with
+  `toISOString()` (always UTC) but fed into an `<input
+  type="datetime-local">`, which both displays AND parses its value as
+  LOCAL time. On this machine (IST, UTC+5:30) that silently shifted the
+  default window by 5.5 hours, landing the search request BEFORE the
+  seeded node's availability even started -- the golden-path test failed
+  with a real, correct "no provider matches" result before any fix
+  existed. Fixed by formatting from local date getters instead; added
+  `frontend/src/components/SearchForm.test.jsx` as a fast-running
+  regression test, confirmed (by re-running it against the pre-fix code)
+  that it actually catches the bug. Frontend suite: 32 unit tests + 3 real
+  E2E tests.
+
+  Also adds `docs/architecture.md` (a component diagram and the request
+  flows for booking/payment, verification/dispute, and P2P discovery) and
+  `CONTRIBUTING.md` (dev setup, what this project expects of a change --
+  real dependencies over mocks, illustrative thresholds labeled as such,
+  honest gaps written down, no abstraction ahead of a real need -- and a
+  table of every live-verification script and what it proves).
+
+  On tightening the illustrative thresholds (`DEFAULT_VERIFICATION_THRESHOLDS`,
+  the alert thresholds in `alerting/alert_rules.yml`) with real usage data:
+  this project has no real production traffic to point at, so doing that
+  honestly isn't possible yet -- manufacturing a number to look researched
+  would be exactly the kind of dishonesty this README argues against
+  elsewhere. `scripts/scheduler_simulation.js`'s backtest against
+  simulated data remains the only threshold-tuning work with any argument
+  behind it; the rest stay labeled illustrative, as `CONTRIBUTING.md` now
+  says explicitly to expect from this codebase until real data exists.
+
 ## Running
 
 ```bash
@@ -909,11 +949,24 @@ python3 -m venv .venv && .venv/bin/pip install -r worker/requirements-dev.txt
 # full network integration demo, including a real sandboxed job (needs docker)
 ./scripts/e2e_demo.sh
 
-# frontend (needs the backend + a worker running -- see scripts/e2e_demo.sh
-# for how to start one by hand, or just run that script and query the API
-# it leaves in place while it's mid-run)
-cd frontend && npm install && npm run dev
+# frontend unit/component tests (32, mocked ../api)
+cd frontend && npm install && npm test
+
+# frontend dev server (needs the backend + a worker running -- see
+# scripts/e2e_demo.sh for how to start one by hand, or just run that
+# script and query the API it leaves in place while it's mid-run)
+npm run dev
+
+# frontend E2E: real Chromium, real backend, real worker, real Docker
+# container -- see e2e/run_e2e.sh's own header for exactly what this
+# proves beyond the mocked component tests above
+npx playwright install chromium   # once
+./e2e/run_e2e.sh
 ```
 
 The signature fixtures shared by both suites are regenerated with
 `.venv/bin/python worker/tools/gen_interop_fixture.py`.
+
+See `docs/architecture.md` for a component diagram and the main request
+flows, and `CONTRIBUTING.md` for dev setup and what this project expects
+of a change.

@@ -17,6 +17,11 @@ build/
 *.log
 coverage/
 
+# Playwright (e2e/) output -- generated per-run, never something to commit
+e2e/test-results/
+e2e/playwright-report/
+e2e/blob-report/
+
 # local state
 *.sqlite
 *.sqlite-shm

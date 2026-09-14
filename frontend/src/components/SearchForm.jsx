@@ -13,7 +13,18 @@ export default function SearchForm({ onSearch, busy }) {
   const now = new Date()
   const in1h = new Date(now.getTime() + 60 * 60 * 1000)
   const in2h = new Date(now.getTime() + 2 * 60 * 60 * 1000)
-  const fmt = (d) => d.toISOString().slice(0, 16)
+  // A real, live-caught bug (found by e2e/tests/golden-path.spec.js running
+  // in a non-UTC timezone): toISOString() always returns UTC wall-clock
+  // time, but an <input type="datetime-local"> both DISPLAYS and, when read
+  // back via `new Date(el.value)`, PARSES its value as LOCAL time. Feeding
+  // a UTC-labeled string into it silently shifted the default search
+  // window by the browser's UTC offset -- correct only for users in UTC,
+  // wrong (here, ~5.5 hours early) everywhere else. Format from the local
+  // getters instead so what's displayed and what's submitted actually agree.
+  const fmt = (d) => {
+    const pad = (n) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+  }
 
   const [vram, setVram] = useState(20)
   const [cpu, setCpu] = useState(8)

@@ -111,3 +111,55 @@ jobs:
       - name: Build
         working-directory: frontend
         run: npm run build
+
+  e2e:
+    # Real-browser proof of the golden path (e2e/run_e2e.sh) -- a real
+    # Postgres, backend, Python worker, Vite dev server, and a real
+    # Chromium clicking through sign-up/search/reserve/pay/run-a-job.
+    # Deliberately does NOT use this workflow's own `services:` postgres
+    # pattern (see the other jobs above): run_e2e.sh manages its own
+    # Postgres via `docker compose up -d postgres`, exactly as it does for
+    # a developer running it locally, so this job runs the SAME script
+    # everyone runs on their own machine rather than a CI-only variant of
+    # it that could silently drift from what's actually documented in
+    # CONTRIBUTING.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install backend dependencies
+        working-directory: backend
+        run: npm install
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+      - name: Install e2e dependencies
+        working-directory: e2e
+        run: npm install
+      - name: Install Playwright's Chromium
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+      - name: Set up the worker's Python environment
+        # run_e2e.sh hardcodes .venv/bin/python, matching the path every
+        # other script and doc in this repo (README.md's own "Running"
+        # section) already uses.
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -r worker/requirements-dev.txt
+          .venv/bin/pip install websockets
+      - name: Pull the base image the E2E job actually runs
+        run: docker pull alpine:3.20
+      - name: Run the real-browser E2E suite
+        run: ./e2e/run_e2e.sh
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+          retention-days: 7
