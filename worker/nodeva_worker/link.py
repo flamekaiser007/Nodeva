@@ -17,6 +17,7 @@ from .canonical import encode
 from .executor import JobSpec, run_job, DockerUnavailable
 from .hardware import detect_gpus, offerable_vram_mb, detect_cpu_cores, detect_ram_mb, NoGpu
 from .reservations import ReservationStore, SlotUnavailable, CONFIRMED, RUNNING
+from .peer import PeerServer, PeerDirectory
 
 log = logging.getLogger("nodeva.worker.link")
 
@@ -26,33 +27,54 @@ RECONNECT_BACKOFF_S = (1, 2, 5, 10, 30)  # capped exponential-ish backoff
 
 class WorkerLink:
     def __init__(self, *, url: str, node_id: str, identity, store: ReservationStore,
-                 price_paise_hr: int):
+                 price_paise_hr: int, peer_port: int | None = None):
+        """`peer_port` opts this node into direct peer connections (Phase 2
+        P2P discovery, see peer.py) -- None (the default) means this node
+        never listens for one and is only ever discoverable by identity, not
+        dialable. Pass 0 to let the OS pick a free port, or a specific port
+        if it needs to match a router's port-forwarding rule."""
         self.url = url
         self.node_id = node_id
         self.identity = identity
         self.store = store
         self.price_paise_hr = price_paise_hr
+        self.peer_port = peer_port
+        self.peer_directory = PeerDirectory()
+        self._peer_server = PeerServer(identity=identity, node_id=node_id, directory=self.peer_directory) \
+            if peer_port is not None else None
+        self._peer_server_bound_port: int | None = None
         self._stop = asyncio.Event()
 
     def stop(self):
         self._stop.set()
 
     async def run_forever(self):
-        attempt = 0
-        while not self._stop.is_set():
-            try:
-                async with websockets.connect(self.url, ping_interval=20) as ws:
-                    log.info("connected to %s", self.url)
-                    attempt = 0
-                    await self._session(ws)
-            except (websockets.ConnectionClosed, OSError) as e:
-                log.warning("connection lost: %s", e)
-            if self._stop.is_set():
-                break
-            delay = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
-            attempt += 1
-            log.info("reconnecting in %ss", delay)
-            await asyncio.sleep(delay)
+        if self._peer_server is not None:
+            # Started once, independent of the platform connection's own
+            # reconnect loop below -- a peer that already has our address
+            # from an earlier introduction should still be able to reach us
+            # while we're between platform reconnect attempts.
+            self._peer_server_bound_port = await self._peer_server.start(port=self.peer_port)
+            log.info("listening for direct peer connections on port %s", self._peer_server_bound_port)
+        try:
+            attempt = 0
+            while not self._stop.is_set():
+                try:
+                    async with websockets.connect(self.url, ping_interval=20) as ws:
+                        log.info("connected to %s", self.url)
+                        attempt = 0
+                        await self._session(ws)
+                except (websockets.ConnectionClosed, OSError) as e:
+                    log.warning("connection lost: %s", e)
+                if self._stop.is_set():
+                    break
+                delay = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
+                attempt += 1
+                log.info("reconnecting in %ss", delay)
+                await asyncio.sleep(delay)
+        finally:
+            if self._peer_server is not None:
+                await self._peer_server.stop()
 
     async def _session(self, ws):
         await self._authenticate(ws)
@@ -78,6 +100,13 @@ class WorkerLink:
         if reply["type"] != "WELCOME":
             raise RuntimeError(f"auth rejected: {reply.get('reason', reply['type'])}")
         log.info("authenticated as %s", self.node_id)
+
+        if self._peer_server_bound_port is not None:
+            # Resent on every (re)connect: a fresh WebSocket is a fresh
+            # source address as far as the platform's own observation of us
+            # is concerned (see hub.js's remoteAddress), even though the
+            # port we listen on ourselves hasn't changed.
+            await ws.send(json.dumps({"type": "PEER_ADDR", "peer_port": self._peer_server_bound_port}))
 
     def _build_heartbeat(self):
         """Pulled out of the send/sleep loop below so it's directly
@@ -122,6 +151,7 @@ class WorkerLink:
                 "JOB_SUBMIT": self._on_job_submit,
                 "RESERVATION_STATUS_QUERY": self._on_status_query,
                 "RESERVE_RELEASE": self._on_release,
+                "PEER_INFO": self._on_peer_info,
             }.get(msg["type"])
             if handler is None:
                 log.warning("unhandled message type %s", msg["type"])
@@ -181,6 +211,18 @@ class WorkerLink:
         self.store.release(rid)
         await ws.send(json.dumps({"type": "RELEASE_ACK", "reservation_id": rid}))
         log.info("released %s on platform request", rid)
+
+    async def _on_peer_info(self, ws, msg):
+        # Unsolicited, pushed only when the platform has a concrete reason
+        # (today: a duplicate-execution verification pairing) -- this node
+        # never asked for it and cannot ask for one about an arbitrary
+        # node_id. Recording it is all this does; nothing here dials out on
+        # its own, since not every caller wants that (see peer.py's
+        # connect_to_peer for the piece that actually would).
+        self.peer_directory.introduce(
+            msg["node_id"], bytes.fromhex(msg["public_key_hex"]), msg.get("host"), msg.get("port"))
+        log.info("introduced to peer %s (%s)", msg["node_id"],
+                  f"{msg.get('host')}:{msg.get('port')}" if msg.get("port") else "no direct route")
 
     async def _on_job_submit(self, ws, msg):
         job_id = msg["job_id"]

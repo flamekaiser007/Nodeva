@@ -72,9 +72,15 @@ export class Hub {
     return this._nodes.has(nodeId);
   }
 
-  /** Wire a freshly-accepted socket into the hub. Handles its whole lifecycle. */
-  handleConnection(socket) {
-    const state = { nodeId: null, publicKey: null, missedBeats: 0, authTimer: null };
+  /** Wire a freshly-accepted socket into the hub. Handles its whole lifecycle.
+   * `remoteAddress` is the platform's own observed source address for this
+   * socket (from the HTTP upgrade request, not anything the client sent) --
+   * see introducePeers, which is the only thing that ever reads it. */
+  handleConnection(socket, { remoteAddress = null } = {}) {
+    const state = {
+      nodeId: null, publicKey: null, missedBeats: 0, authTimer: null,
+      remoteAddress, peerPort: null,
+    };
 
     state.authTimer = setTimeout(() => {
       this._safeClose(socket, 4001, 'auth timeout');
@@ -101,6 +107,14 @@ export class Hub {
       case TYPE.HEARTBEAT:
         state.missedBeats = 0;
         this._onHeartbeat(state.nodeId, msg);
+        return;
+      case TYPE.PEER_ADDR:
+        // No validation of the port number beyond "it's whatever the node
+        // sent" -- the worst a node can do by lying about its own port is
+        // make ITSELF undialable or point peers at its own closed port,
+        // never redirect traffic to a third party (unlike a self-reported
+        // host, which is why host comes from the observed socket instead).
+        state.peerPort = Number.isInteger(msg.peer_port) ? msg.peer_port : null;
         return;
       case TYPE.RECEIPT:
       case TYPE.DENY:
@@ -246,6 +260,40 @@ export class Hub {
     return this._sendAwait(conn.socket, reservationId, this._releaseTimeoutMs, {
       type: TYPE.RESERVE_RELEASE, reservation_id: reservationId,
     });
+  }
+
+  /** Rendezvous: introduces two online nodes to each other by sending each
+   * one a PEER_INFO about the other, so they can attempt a direct connection
+   * without the platform relaying their traffic (see protocol.js's file
+   * comment on PEER_INFO for why this is push-only, never a lookup a node
+   * can trigger itself). A no-op for whichever side is offline or has never
+   * sent PEER_ADDR -- introducing a node with no dialable port is not
+   * useful, and the caller (server.js, pairing a duplicate-execution
+   * verification job) has no interest in that partial case succeeding
+   * silently, so this never throws either way. Returns which sides were
+   * actually notified, purely so tests can assert on it without inspecting
+   * socket internals. */
+  introducePeers(nodeIdA, nodeIdB) {
+    const a = this._nodes.get(nodeIdA);
+    const b = this._nodes.get(nodeIdB);
+    const notified = { a: false, b: false };
+    if (a && b && b.peerPort !== null) {
+      this._send(a.socket, {
+        type: TYPE.PEER_INFO, node_id: nodeIdB,
+        public_key_hex: b.publicKey.toString('hex'),
+        host: b.remoteAddress, port: b.peerPort,
+      });
+      notified.a = true;
+    }
+    if (a && b && a.peerPort !== null) {
+      this._send(b.socket, {
+        type: TYPE.PEER_INFO, node_id: nodeIdA,
+        public_key_hex: a.publicKey.toString('hex'),
+        host: a.remoteAddress, port: a.peerPort,
+      });
+      notified.b = true;
+    }
+    return notified;
   }
 
   _sendAwait(socket, correlationId, timeoutMs, payload) {

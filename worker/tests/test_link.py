@@ -152,3 +152,48 @@ def test_heartbeat_includes_total_vram_alongside_free_vram(link, monkeypatch):
     msg = link._build_heartbeat()
     assert msg["gpu"]["vram_total_mb"] == 24564
     assert msg["gpu"]["vram_free_mb"] == 24564 - 1832 - 1024
+
+
+# --- P2P discovery (peer.py) wiring -------------------------------------
+
+def test_peer_discovery_is_off_by_default(link):
+    # peer_port defaults to None -- a node that never opts in never listens
+    # for direct connections at all, matching the off-by-default pattern
+    # every other opt-in capability in this project follows.
+    assert link.peer_port is None
+    assert link._peer_server is None
+
+
+def test_configuring_a_peer_port_creates_a_server_but_does_not_start_it_yet():
+    from pathlib import Path
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        store = ReservationStore(Path(d) / "res.sqlite")
+        l = WorkerLink(url="ws://unused", node_id="node-1", identity=FakeIdentity(),
+                        store=store, price_paise_hr=4300, peer_port=0)
+        assert l._peer_server is not None
+        # start() itself is only called from run_forever -- constructing a
+        # WorkerLink must never open a socket as a side effect.
+        assert l._peer_server_bound_port is None
+
+
+def test_peer_info_from_the_platform_is_recorded_in_the_directory(link):
+    ws = FakeWs()
+    run(link._on_peer_info(ws, {
+        "node_id": "node-2", "public_key_hex": "ab" * 32, "host": "203.0.113.5", "port": 41000,
+    }))
+    known = link.peer_directory.get("node-2")
+    assert known == {"public_key": bytes.fromhex("ab" * 32), "host": "203.0.113.5", "port": 41000}
+    # A pure record -- nothing is sent back to the platform for this.
+    assert ws.sent == []
+
+
+def test_peer_info_with_no_dialable_route_is_still_recorded(link):
+    # host/port: null means "we know who this node is, but not how to reach
+    # it directly" -- e.g. the sibling never advertised a peer port. Still
+    # worth recording: connect_to_peer's own job is to fail fast on this,
+    # not this handler's.
+    run(link._on_peer_info(FakeWs(), {
+        "node_id": "node-3", "public_key_hex": "cd" * 32, "host": None, "port": None,
+    }))
+    assert link.peer_directory.get("node-3")["port"] is None

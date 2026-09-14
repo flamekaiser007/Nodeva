@@ -27,6 +27,14 @@ export const TYPE = {
   JOB_RESULT: 'JOB_RESULT',             // { job_id, status, exit_code, stdout, stderr, duration_seconds } -- unsolicited, sent whenever the job finishes
   RESERVATION_STATUS: 'RESERVATION_STATUS', // { reservation_id, status } -- status is one of the node's own local vocabulary (held/confirmed/running/completed/released), or null if the node has never heard of this reservation_id
   RELEASE_ACK: 'RELEASE_ACK',           // { reservation_id } -- the node has released its local hold, regardless of what it was
+  // Opt-in: a node only sends this if it chose to open a local listener for
+  // direct peer connections (see worker/nodeva_worker/peer.py). Absent this,
+  // the platform has no port to hand out and PEER_INFO below simply carries
+  // host/port: null -- the node is still discoverable by identity, just not
+  // dialable directly. Resent after every reconnect, since a fresh TCP
+  // connection has a fresh (possibly NATed) source address on the platform's
+  // side of things.
+  PEER_ADDR: 'PEER_ADDR',               // { peer_port }
 
   // backend -> worker
   CHALLENGE: 'CHALLENGE',               // { nonce }
@@ -50,6 +58,18 @@ export const TYPE = {
   // sides agree again and the window becomes bookable rather than
   // permanently squatted on by a reservation nobody can act on.
   RESERVE_RELEASE: 'RESERVE_RELEASE',   // { reservation_id }
+  // Rendezvous, not a general directory: sent only when the platform has a
+  // concrete reason to introduce two specific nodes (today: they were just
+  // paired for duplicate-execution verification, see
+  // jobs/verification.js's file header). Never a lookup a node can trigger
+  // for an arbitrary other node_id -- that would leak provider network
+  // topology to anyone who asks. `host` is the platform's OWN observed
+  // remote address for that node's socket (not self-reported -- a node
+  // cannot spoof this to point a peer at a victim's IP), `port` is whatever
+  // that node last advertised via PEER_ADDR, or null if it never did (no
+  // direct route known; see docs/reservation-protocol.md's "what is NOT
+  // solved yet" for the NAT case this does not cover).
+  PEER_INFO: 'PEER_INFO',               // { node_id, public_key_hex, host, port }
   ERROR: 'ERROR',                       // { message }
 };
 

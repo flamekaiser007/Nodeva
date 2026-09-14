@@ -1011,6 +1011,16 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
           await pool.query(
             "UPDATE reservations SET status='running', updated_at=now() WHERE reservation_id=$1",
             [sibling.reservation_id]);
+          // Rendezvous (Phase 2 P2P discovery groundwork, see
+          // ws/hub.js#introducePeers): the only two nodes in this whole
+          // system that ever have a real reason to talk to each other
+          // directly are a verification pair, since they are about to
+          // (independently) run the identical workload. Best-effort and
+          // silent by design -- introducePeers itself never throws, and
+          // whether either node is even listening for peer connections is
+          // opt-in on the worker side, so "nothing happened" is the normal
+          // case today, not a failure of this job submission.
+          hub.introducePeers(resv.node_id, sibling.node_id);
         } catch (e) {
           // Graceful degradation, not a hard failure: the first job is
           // ALREADY running by this point (its JOB_ACCEPTED already came
@@ -1638,6 +1648,6 @@ async function ensureAccounts(client, userId) {
 
 export function attachWebSocketServer(server, hub, path = '/worker') {
   const wss = new WebSocketServer({ server, path });
-  wss.on('connection', (socket) => hub.handleConnection(socket));
+  wss.on('connection', (socket, req) => hub.handleConnection(socket, { remoteAddress: req.socket.remoteAddress }));
   return wss;
 }

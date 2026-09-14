@@ -13,7 +13,7 @@ out, people who need a GPU for an hour rent it in.
 | PostgreSQL | resource advertisements |
 | payment gateway, escrow, settlement | availability and reservations (node-authoritative) |
 | payouts, refunds, disputes | job execution and sandboxing |
-| reputation (for now) | peer discovery (Phase 2) |
+| reputation (for now) | peer discovery for verification pairs (Phase 2, started) |
 
 The claim worth defending is narrower and truer than "decentralized compute":
 **compute and marketplace coordination are distributed across independently
@@ -673,9 +673,53 @@ Phase 1, early. What exists and is tested:
   process metrics) served only with the correct `ADMIN_TOKEN`. Backend
   suite is now 260 tests.
 
-Not built yet: P2P discovery beyond one platform-worker link. This is
-Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
-libp2p, and shouldn't have it") and is deliberately not started early.
+- **Phase 2 P2P discovery: rendezvous-style, for verification pairs.** The
+  master brief phases this in deliberately late ("Phase 1 doesn't need
+  libp2p, and shouldn't have it"); this is the first real slice, scoped to
+  the one place in this codebase two nodes ever have an actual reason to
+  talk to each other: a duplicate-execution verification pairing
+  (jobs/verification.js). `ws/hub.js#introducePeers` sends each node a
+  `PEER_INFO` about the other -- identity (public key) plus a dialable
+  address -- but the address is the platform's own OBSERVED remote address
+  for that node's existing socket, never anything the node claims about
+  itself (a node lying about its own port can only make itself undialable,
+  never redirect a peer at a third party). This is push-only: a node cannot
+  look up an arbitrary other node_id, which would leak provider network
+  topology to anyone who asked. On the worker side (`peer.py`), an opt-in
+  local listener accepts direct connections and requires the connecting
+  node to sign a nonce with the SAME Ed25519 key already registered with
+  the platform -- and then proves its own identity back, mutually -- before
+  answering anything. Nothing auto-connects: introduction and dialing are
+  deliberately separate, since what a direct channel is actually used FOR
+  is a decision for whoever wants it, not this module.
+
+  HONEST LIMIT, unchanged from before this work: this is not NAT traversal.
+  A node behind a typical residential/CGNAT setup with no port forwarding
+  still cannot accept a direct inbound connection, for the same reason the
+  platform itself never could. Real NAT traversal needs STUN/TURN-style
+  relays and hole punching; this only solves discovery and direct
+  connection for nodes that are actually reachable (public IP,
+  port-forwarded, or the same network).
+
+  Tested with 11 Node tests (`peerDiscovery.test.js`'s Hub-level unit tests,
+  `peerDiscovery-integration.test.js`'s real-HTTP-and-real-Postgres proof
+  that submitting a `verify_against_reservation_id` job genuinely triggers
+  an introduction) and 12 pytest tests (`test_peer.py`'s real localhost TCP
+  handshakes -- happy path, an impostor with the wrong private key rejected,
+  a connector never introduced rejected, concurrent connections) plus 5 new
+  `test_link.py` tests for the worker-side wiring. Caught one real bug live:
+  a `PeerServer` bound only to `0.0.0.0` (IPv4) silently refused every
+  connection on a dual-stack machine, because the platform's own observed
+  loopback address is `::1` (IPv6) -- fixed by binding the SAME advertised
+  port on both an IPv4 and an IPv6 listener. Verified live end-to-end via
+  `scripts/p2p_demo.sh`: a real backend, two independent real Python worker
+  processes each running its own TCP peer listener, a real Postgres-backed
+  verification pairing, and a real mutually-authenticated direct socket
+  between the two worker processes carrying a real ping/pong -- all without
+  the two workers ever being told about each other except through the
+  platform's one-time introduction. Backend suite is now 267 tests; worker
+  suite is now 59 tests (44 passing, 15 skipped without a live GPU/network
+  dependency).
 
 ## Running
 

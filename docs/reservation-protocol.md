@@ -123,9 +123,21 @@ and the identical slot could genuinely be rebooked afterward.
 - **Clock skew.** Hold TTLs compare timestamps across machines. Currently
   assumes loose NTP sync; a node with a fast clock releases early. Needs a
   monotonic handshake or a generous safety margin before production.
-- **NAT — solved for Phase 1, not for Phase 2.** The worker dials out over
-  WebSocket and holds the connection open; the platform never opens a socket
-  to a node. This works today because there is exactly one platform to
-  connect to. It stops working once nodes need to reach each other directly
-  for P2P discovery (Phase 2), which is a harder problem (relays, hole
-  punching) than a single long-lived client connection to a known server.
+- **NAT traversal — still not solved.** Phase 2 P2P discovery now exists
+  (`backend/src/ws/hub.js#introducePeers`, `worker/nodeva_worker/peer.py`):
+  when the platform pairs two nodes for duplicate-execution verification, it
+  introduces them to each other by identity (public key) and by the
+  platform's own OBSERVED address for each node's existing connection, not
+  anything either node claims about itself. If both nodes have opted into a
+  local peer listener, they open a real, mutually-authenticated direct TCP
+  connection to each other, reusing their existing Ed25519 identities --
+  "the trust artifact does not change, only the transport" turned out to be
+  true. What this does NOT do is get through a NAT that isn't already
+  forwarding the advertised port: a node behind a typical residential or
+  CGNAT setup with no port forwarding still cannot accept an inbound
+  connection, direct or otherwise, for the exact reason described above (the
+  platform itself has never been able to open a socket to a node either).
+  Solving that needs STUN/TURN-style relays and hole punching, which is a
+  harder problem this does not attempt. See `scripts/p2p_demo.sh` for a live
+  run proving the discovery + direct-connection half against two real
+  worker processes.
