@@ -4,22 +4,38 @@
 // where a unit test of any one piece would miss a real bug.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { createPool } from '../src/db/pool.js';
 import { createApp } from '../src/api/server.js';
+import { TYPE } from '../src/ws/protocol.js';
 
 const DATABASE_URL = process.env.DATABASE_URL
   ?? 'postgresql://nodeva:nodeva_dev@localhost:5433/nodeva';
 process.env.JWT_SECRET ??= crypto.randomBytes(32).toString('hex');
 
-let pool, server, base;
+class FakeSocket extends EventEmitter {
+  constructor(onSend) { super(); this._onSend = onSend; }
+  send(raw) { const msg = JSON.parse(raw); this._onSend?.(msg); }
+  close() { this.emit('close'); }
+  receive(obj) { this.emit('message', Buffer.from(JSON.stringify(obj))); }
+}
+
+function keypair() {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const raw = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
+  return { raw, sign: (buf) => crypto.sign(null, buf, privateKey) };
+}
+
+let pool, server, base, hub;
 let dbAvailable = false;
 try {
   pool = createPool(DATABASE_URL, { connectionTimeoutMillis: 2000 });
   await pool.query('SELECT 1');
-  const { app } = createApp(pool);
-  server = http.createServer(app);
+  const created = createApp(pool);
+  hub = created.hub;
+  server = http.createServer(created.app);
   await new Promise((resolve) => server.listen(0, resolve));
   base = `http://localhost:${server.address().port}`;
   dbAvailable = true;
@@ -27,6 +43,36 @@ try {
 
 const skip = !dbAvailable && 'requires a reachable Postgres (see docker-compose.yml)';
 test.after(() => { server?.close(); pool?.end(); });
+
+const tick = () => new Promise((r) => setImmediate(r));
+
+// Just enough of a worker to authenticate and then hand-send whatever
+// HEARTBEAT this test wants -- checkHardwareMismatch only cares about the
+// message content, not anything about reservations or jobs.
+class MinimalWorker {
+  constructor(nodeId, kp) {
+    this.nodeId = nodeId; this.kp = kp;
+    this.sock = new FakeSocket(() => {});
+  }
+  _await(predicate) {
+    return new Promise((resolve) => {
+      this.sock._onSend = (msg) => { if (predicate(msg)) resolve(msg); };
+    });
+  }
+  async connect(hubInstance) {
+    const challenge = this._await((m) => m.type === TYPE.CHALLENGE);
+    hubInstance.handleConnection(this.sock);
+    this.sock.receive({ type: TYPE.HELLO, node_id: this.nodeId });
+    const c = await challenge;
+    const sig = this.kp.sign(Buffer.from(c.nonce, 'utf8'));
+    const welcomed = this._await((m) => m.type === TYPE.WELCOME);
+    this.sock.receive({ type: TYPE.CHALLENGE_RESPONSE, signature_hex: sig.toString('hex') });
+    await welcomed;
+  }
+  heartbeat(msg) {
+    this.sock.receive({ type: TYPE.HEARTBEAT, ...msg });
+  }
+}
 
 async function signup(displayName) {
   const res = await fetch(`${base}/auth/signup`, {
@@ -150,3 +196,86 @@ test('earnings buckets reflect real ledger entries, not just a lifetime total', 
   assert.equal(body.earnings.week_paise, 1000, 'only the 2-day-old entry is within 7 days');
   assert.equal(body.earnings.month_paise, 1000, 'the 40-day-old entry is outside the 30-day bucket');
 });
+
+// --- hardware mismatch (self-reported, honest-drift detection) ---------
+
+async function enrollAndConnect(token, declared) {
+  const kp = keypair();
+  const { node_id } = await (await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' },
+    body: JSON.stringify({ public_key_hex: kp.raw.toString('hex'), ...declared }),
+  })).json();
+  const worker = new MinimalWorker(node_id, kp);
+  await worker.connect(hub);
+  return { node_id, worker };
+}
+
+test('a node reporting specs matching its enrollment shows no hardware_mismatch',
+  { skip }, async () => {
+    const { token } = await signup('Honest Provider');
+    await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+    const { node_id, worker } = await enrollAndConnect(token, {
+      gpu_model: 'RTX 4090', gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+    });
+    worker.heartbeat({
+      gpu: { model: 'RTX 4090', vram_total_mb: 24564, vram_free_mb: 20000 }, // within 10% tolerance
+      cpu_cores: 16, ram_mb: 32000, // within 10% tolerance of 32768
+      live_reservations: 0,
+    });
+    await tick();
+
+    const body = await (await fetch(`${base}/providers/me/dashboard`, { headers: authed(token) })).json();
+    const node = body.nodes.find((n) => n.node_id === node_id);
+    assert.equal(node.hardware_mismatch, null);
+  });
+
+test('a node reporting fewer CPU cores than enrolled is flagged, exactly (no tolerance)',
+  { skip }, async () => {
+    const { token } = await signup('Overclaiming Provider');
+    await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+    const { node_id, worker } = await enrollAndConnect(token, {
+      gpu_model: 'RTX 4090', gpu_vram_mb: 24576, cpu_cores: 32, ram_mb: 32768, price_paise_hr: 4300,
+    });
+    worker.heartbeat({ gpu: null, cpu_cores: 8, ram_mb: 32768, live_reservations: 0 });
+    await tick();
+
+    const body = await (await fetch(`${base}/providers/me/dashboard`, { headers: authed(token) })).json();
+    const node = body.nodes.find((n) => n.node_id === node_id);
+    assert.ok(node.hardware_mismatch);
+    const cpuMismatch = node.hardware_mismatch.find((m) => m.field === 'cpu_cores');
+    assert.deepEqual(cpuMismatch, { field: 'cpu_cores', declared: 32, reported: 8 });
+  });
+
+test('a node reporting far less RAM than enrolled (beyond tolerance) is flagged',
+  { skip }, async () => {
+    const { token } = await signup('Ram Mismatch Provider');
+    await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+    const { node_id, worker } = await enrollAndConnect(token, {
+      gpu_model: 'RTX 4090', gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 65536, price_paise_hr: 4300,
+    });
+    worker.heartbeat({ gpu: null, cpu_cores: 16, ram_mb: 16384, live_reservations: 0 }); // way under 65536
+    await tick();
+
+    const body = await (await fetch(`${base}/providers/me/dashboard`, { headers: authed(token) })).json();
+    const node = body.nodes.find((n) => n.node_id === node_id);
+    assert.ok(node.hardware_mismatch);
+    assert.ok(node.hardware_mismatch.some((m) => m.field === 'ram_mb'));
+  });
+
+test('a node before its first heartbeat has hardware_mismatch: null, not a false flag',
+  { skip }, async () => {
+    const { token } = await signup('No Heartbeat Yet Provider');
+    await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+    const pubKeyHex = crypto.randomBytes(32).toString('hex');
+    const { node_id } = await (await fetch(`${base}/nodes`, {
+      method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' },
+      body: JSON.stringify({
+        public_key_hex: pubKeyHex, gpu_model: 'RTX 4090',
+        gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+      }),
+    })).json();
+
+    const body = await (await fetch(`${base}/providers/me/dashboard`, { headers: authed(token) })).json();
+    const node = body.nodes.find((n) => n.node_id === node_id);
+    assert.equal(node.hardware_mismatch, null, 'no data yet must not be reported as a mismatch');
+  });

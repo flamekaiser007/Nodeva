@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 from nodeva_worker.hardware import (
     detect_gpus, offerable_vram_mb, NoGpu, _parse_int, GpuInfo,
+    detect_cpu_cores, detect_ram_mb,
 )
 
 # Real nvidia-smi --format=csv,noheader,nounits output shapes.
@@ -65,3 +66,33 @@ def test_offerable_vram_excludes_in_use_memory_and_headroom():
 def test_offerable_vram_never_goes_negative():
     g = GpuInfo("x", 4096, 4000, 90, 70, 100, "1")
     assert offerable_vram_mb(g) == 0
+
+
+# --- detect_cpu_cores / detect_ram_mb ---------------------------------------
+
+def test_detect_cpu_cores_reports_a_real_count():
+    assert detect_cpu_cores(_cpu_count=lambda: 16) == 16
+
+
+def test_detect_cpu_cores_can_report_unknown():
+    # os.cpu_count() itself can return None on a platform that genuinely
+    # can't say -- this must pass that through honestly, not fabricate 1.
+    assert detect_cpu_cores(_cpu_count=lambda: None) is None
+
+
+def test_detect_ram_mb_computes_from_page_size_and_phys_pages():
+    sysconf_values = {'SC_PAGE_SIZE': 4096, 'SC_PHYS_PAGES': 8_388_608}  # 32 GiB
+    assert detect_ram_mb(_sysconf=lambda name: sysconf_values[name]) == 32768
+
+
+def test_detect_ram_mb_returns_none_when_sysconf_is_unavailable():
+    # Windows has no os.sysconf at all -- AttributeError is the real
+    # failure mode there, not something to let crash the heartbeat loop.
+    def boom(name):
+        raise AttributeError("module 'os' has no attribute 'sysconf'")
+    assert detect_ram_mb(_sysconf=boom) is None
+
+
+def test_detect_ram_mb_returns_none_on_nonsensical_values():
+    assert detect_ram_mb(_sysconf=lambda name: 0) is None
+    assert detect_ram_mb(_sysconf=lambda name: -1) is None

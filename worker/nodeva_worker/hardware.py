@@ -2,15 +2,27 @@
 
 Everything here is SELF-REPORTED, and the platform must treat it that way. A
 node claiming an H100 it does not have is trivial; nothing in this file can
-prevent that. What stops it is benchmark attestation on the platform side
+prevent that -- a deliberately malicious operator controls this very code and
+can always report whatever number they want, however this is implemented.
+What stops it is benchmark attestation on the platform side
 (compute_nodes.perf_score stays NULL until the node passes), plus the fact that
 a lying node fails jobs and loses reputation. Detection is a convenience for
 honest providers, not a security control.
 
+That convenience is worth having anyway: detect_cpu_cores/detect_ram_mb exist
+so the backend can flag an HONEST mismatch (a provider's enrollment form
+claim drifted from what their machine actually reports -- upgraded RAM
+without updating the listing, fat-fingered a number, GPU swapped) as a
+"self-reported, unverified" signal on the dashboard, exactly the case this
+module's own docstring already anticipated for GPU model/VRAM before this
+existed for CPU/RAM at all.
+
 nvidia-smi is used rather than a Python NVML binding to keep the worker's
 install footprint small: every machine with a usable NVIDIA GPU already has it.
+CPU/RAM detection uses only the standard library for the same reason.
 """
 
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, asdict
@@ -94,6 +106,32 @@ def _run_nvidia_smi() -> str:
         raise NoGpu("nvidia-smi timed out; driver may be unresponsive") from e
     except subprocess.CalledProcessError as e:
         raise NoGpu(f"nvidia-smi failed: {e.stderr.strip()}") from e
+
+
+def detect_cpu_cores(_cpu_count=None) -> int | None:
+    """Logical CPU count, or None if the platform genuinely can't say --
+    same honest-failure posture as detect_gpus: a caller must handle
+    "unknown", never assume a number came back."""
+    counter = _cpu_count or os.cpu_count
+    return counter()
+
+
+def detect_ram_mb(_sysconf=None) -> int | None:
+    """Total physical RAM via POSIX sysconf (Linux and macOS both support
+    SC_PAGE_SIZE/SC_PHYS_PAGES) -- no extra dependency, same reasoning as
+    nvidia-smi over an NVML binding. Windows has no sysconf at all; this
+    returns None there rather than raising, since "we don't know" is an
+    honest answer a CPU-only or misconfigured node can also legitimately
+    give for cpu_cores above."""
+    sysconf = _sysconf or os.sysconf
+    try:
+        page_size = sysconf('SC_PAGE_SIZE')
+        phys_pages = sysconf('SC_PHYS_PAGES')
+    except (ValueError, OSError, AttributeError):
+        return None
+    if page_size <= 0 or phys_pages <= 0:
+        return None
+    return (page_size * phys_pages) // (1024 * 1024)
 
 
 def offerable_vram_mb(gpu: GpuInfo, headroom_mb: int = 1024) -> int:

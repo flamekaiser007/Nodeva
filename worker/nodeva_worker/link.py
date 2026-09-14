@@ -15,7 +15,7 @@ import websockets
 
 from .canonical import encode
 from .executor import JobSpec, run_job, DockerUnavailable
-from .hardware import detect_gpus, offerable_vram_mb, NoGpu
+from .hardware import detect_gpus, offerable_vram_mb, detect_cpu_cores, detect_ram_mb, NoGpu
 from .reservations import ReservationStore, SlotUnavailable, CONFIRMED, RUNNING
 
 log = logging.getLogger("nodeva.worker.link")
@@ -79,24 +79,38 @@ class WorkerLink:
             raise RuntimeError(f"auth rejected: {reply.get('reason', reply['type'])}")
         log.info("authenticated as %s", self.node_id)
 
+    def _build_heartbeat(self):
+        """Pulled out of the send/sleep loop below so it's directly
+        testable -- a `while True` body has no way to assert against a
+        single message without either mocking asyncio.sleep or letting a
+        test hang. Self-reported, same as everything else in hardware.py --
+        lets the platform flag an HONEST mismatch against the enrollment
+        form's claim (upgraded hardware, a typo, a swapped GPU), not a
+        security check (see hardware.py's file header for why one isn't
+        possible here)."""
+        gpu = None
+        try:
+            gpus = detect_gpus()
+            g = gpus[0]
+            gpu = {
+                "model": g.model,
+                "vram_total_mb": g.vram_total_mb,
+                "vram_free_mb": offerable_vram_mb(g),
+                "utilization_pct": g.utilization_pct,
+                "temperature_c": g.temperature_c,
+            }
+        except NoGpu:
+            pass  # CPU-only node; heartbeat still proves liveness
+        return {
+            "type": "HEARTBEAT", "gpu": gpu,
+            "cpu_cores": detect_cpu_cores(),
+            "ram_mb": detect_ram_mb(),
+            "live_reservations": self.store.live_count(),
+        }
+
     async def _heartbeat_loop(self, ws):
         while True:
-            gpu = None
-            try:
-                gpus = detect_gpus()
-                g = gpus[0]
-                gpu = {
-                    "model": g.model,
-                    "vram_free_mb": offerable_vram_mb(g),
-                    "utilization_pct": g.utilization_pct,
-                    "temperature_c": g.temperature_c,
-                }
-            except NoGpu:
-                pass  # CPU-only node; heartbeat still proves liveness
-            await ws.send(json.dumps({
-                "type": "HEARTBEAT", "gpu": gpu,
-                "live_reservations": self.store.live_count(),
-            }))
+            await ws.send(json.dumps(self._build_heartbeat()))
             await asyncio.sleep(HEARTBEAT_INTERVAL_S)
 
     async def _message_loop(self, ws):

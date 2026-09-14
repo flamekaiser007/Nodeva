@@ -138,6 +138,8 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
       // without it there is no live data to show, only last_seen_at.
       heartbeats.set(nodeId, {
         gpu: msg.gpu ?? null,
+        cpu_cores: msg.cpu_cores ?? null,
+        ram_mb: msg.ram_mb ?? null,
         live_reservations: msg.live_reservations ?? null,
         received_at: Date.now(),
       });
@@ -385,6 +387,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
           ...n,
           online: hub.isOnline(n.node_id),
           heartbeat: hb ? { ...hb, age_ms: Date.now() - hb.received_at } : null,
+          hardware_mismatch: checkHardwareMismatch(n, hb),
         };
       });
 
@@ -1167,6 +1170,43 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   // (payments/refunds.js's processRefundRetries) against the same gateway
   // instance the app itself uses -- not a second one reading env vars again.
   return { app, hub, paymentGateway: razorpay };
+}
+
+// Compares a node's ENROLLED specs (worker/hardware.py's file header: self-
+// reported at enrollment, never verifiable -- a deliberately malicious
+// operator can always claim whatever they want) against what its own
+// worker most recently reported over a live heartbeat. This is explicitly
+// NOT a security check: both numbers come from the same operator, so a
+// dishonest one can make them agree trivially by lying consistently. What
+// it catches is an HONEST drift -- upgraded RAM without updating the
+// listing, a typo at enrollment, a swapped GPU -- surfaced to the provider
+// (and, via the same shape, could be shown to a buyer) as a "your listing
+// doesn't match what your machine reports" flag, not an accusation.
+//
+// Tolerant on RAM/VRAM (10%) since a heartbeat reports what the OS/driver
+// actually sees (rounded, minus reserved regions) while an enrollment form
+// value is often a rounded marketing number (32 vs 34359738368 bytes) --
+// exact-equality would falsely flag every honest node. CPU cores has no
+// tolerance: a logical core count is exact on both sides, so any
+// difference is worth surfacing.
+function checkHardwareMismatch(declared, heartbeat) {
+  if (!heartbeat) return null; // nothing reported yet -- not a mismatch, just unknown
+  const mismatches = [];
+  const withinTolerance = (a, b, pct) => a == null || b == null || Math.abs(a - b) <= a * pct;
+
+  if (heartbeat.cpu_cores != null && heartbeat.cpu_cores !== declared.cpu_cores) {
+    mismatches.push({ field: 'cpu_cores', declared: declared.cpu_cores, reported: heartbeat.cpu_cores });
+  }
+  if (heartbeat.ram_mb != null && !withinTolerance(declared.ram_mb, heartbeat.ram_mb, 0.10)) {
+    mismatches.push({ field: 'ram_mb', declared: declared.ram_mb, reported: heartbeat.ram_mb });
+  }
+  if (heartbeat.gpu?.vram_total_mb != null
+      && !withinTolerance(declared.gpu_vram_mb, heartbeat.gpu.vram_total_mb, 0.10)) {
+    mismatches.push({
+      field: 'gpu_vram_mb', declared: declared.gpu_vram_mb, reported: heartbeat.gpu.vram_total_mb,
+    });
+  }
+  return mismatches.length > 0 ? mismatches : null;
 }
 
 // executor.py's JobResult.status vocabulary -> jobs.status (schema-constrained).

@@ -113,3 +113,42 @@ def test_release_frees_the_slot_for_a_real_rebooking(link):
 
     body = link.store.try_lock("r2", T0, T0 + HOUR, 4300)  # must not raise
     assert body["reservation_id"] == "r2"
+
+
+# --- heartbeat content -------------------------------------------------
+
+def test_heartbeat_reports_real_cpu_and_ram_alongside_gpu_and_liveness(link, monkeypatch):
+    # Proves the message WorkerLink actually sends has the shape
+    # api/server.js's onHeartbeat expects -- a unit test on hardware.py's
+    # detect_cpu_cores/detect_ram_mb alone wouldn't catch a mistake in how
+    # link.py wires them into this message.
+    import nodeva_worker.link as link_module
+    monkeypatch.setattr(link_module, "detect_cpu_cores", lambda: 16)
+    monkeypatch.setattr(link_module, "detect_ram_mb", lambda: 32768)
+    monkeypatch.setattr(link_module, "detect_gpus", lambda: (_ for _ in ()).throw(link_module.NoGpu("no gpu")))
+
+    msg = link._build_heartbeat()
+    assert msg["type"] == "HEARTBEAT"
+    assert msg["cpu_cores"] == 16
+    assert msg["ram_mb"] == 32768
+    assert msg["gpu"] is None
+    assert msg["live_reservations"] == 0
+
+
+def test_heartbeat_includes_total_vram_alongside_free_vram(link, monkeypatch):
+    # vram_free_mb already existed for live availability; vram_total_mb is
+    # what lets the backend compare against the node's ENROLLED
+    # gpu_vram_mb claim, which free VRAM alone can't do (free VRAM is
+    # always less than total, by design -- comparing it to the enrollment
+    # claim would flag every honest node as a mismatch).
+    import nodeva_worker.link as link_module
+    from nodeva_worker.hardware import GpuInfo
+    monkeypatch.setattr(link_module, "detect_cpu_cores", lambda: 8)
+    monkeypatch.setattr(link_module, "detect_ram_mb", lambda: 16384)
+    monkeypatch.setattr(
+        link_module, "detect_gpus",
+        lambda: [GpuInfo("RTX 4090", 24564, 1832, 31, 47, 371, "550.54.14")])
+
+    msg = link._build_heartbeat()
+    assert msg["gpu"]["vram_total_mb"] == 24564
+    assert msg["gpu"]["vram_free_mb"] == 24564 - 1832 - 1024

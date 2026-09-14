@@ -480,6 +480,43 @@ Phase 1, early. What exists and is tested:
   back and stopping before any later file is even attempted. Full suite
   is now 236 tests.
 
+- **Honest hardware-mismatch detection.** Provider specs (`gpu_model`,
+  `cpu_cores`, `ram_mb`) were self-reported at enrollment with nothing
+  cross-checking them against what a node's own worker actually has --
+  `worker/hardware.py`'s own file header already named this as
+  unverifiable in principle ("a deliberately malicious operator... can
+  always report whatever number they want"), but CPU/RAM had no
+  detection at all until now, not even the honest-provider convenience the
+  file's own reasoning called for. Added `detect_cpu_cores`/`detect_ram_mb`
+  (stdlib only -- `os.cpu_count()` and POSIX `sysconf`, no new dependency,
+  same reasoning as `nvidia-smi` over an NVML binding) and `vram_total_mb`
+  to the existing GPU heartbeat field. `api/server.js`'s
+  `checkHardwareMismatch` compares a node's live heartbeat against its
+  enrollment claim (exact for CPU cores, 10%-tolerant for RAM/VRAM since a
+  heartbeat reports what the OS actually sees while an enrollment value is
+  often a rounded marketing number) and surfaces it on the provider
+  dashboard as a listing-discrepancy notice -- explicitly framed as
+  "your listing doesn't match what your machine reports," never phrased as
+  an accusation, since both numbers come from the same operator and a
+  dishonest one can always make them agree by lying consistently. This is
+  the same "detection is a convenience, not a security control" posture
+  `hardware.py` already stated for GPU model, now actually implemented for
+  the fields that previously had none.
+
+  Tested at the worker level (`detect_cpu_cores`/`detect_ram_mb` unit
+  tests including "platform genuinely doesn't know," and a
+  `_build_heartbeat` unit extracted specifically so the heartbeat's exact
+  message shape is directly testable rather than living only inside an
+  infinite `while True` loop) and at the backend level (a real worker
+  authenticating over the real Hub and hand-sending a heartbeat, proving
+  match/no-tolerance-CPU-mismatch/beyond-tolerance-RAM-mismatch/no-heartbeat-yet
+  all read correctly through the real dashboard endpoint). Verified live
+  end to end: enrolled a node claiming 64 cores / 128 GB RAM, connected a
+  REAL worker on this actual dev machine (8 cores / 8 GB, genuinely
+  detected), and watched the real mismatch appear on the dashboard in an
+  actual browser. Worker suite is now 48 tests (+8), backend suite 240
+  (+4).
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.

@@ -214,6 +214,37 @@ function NodeCard({ node }) {
       ) : node.online ? (
         <div className="mt-2 text-xs text-neutral-400">waiting for first heartbeat…</div>
       ) : null}
+      {node.hardware_mismatch && <HardwareMismatchNotice mismatches={node.hardware_mismatch} />}
+    </div>
+  )
+}
+
+const MISMATCH_FIELD = {
+  cpu_cores: { label: 'CPU cores', format: (v) => `${v} cores` },
+  ram_mb: { label: 'RAM', format: (v) => `${(v / 1024).toFixed(0)} GB` },
+  gpu_vram_mb: { label: 'GPU VRAM', format: (v) => `${(v / 1024).toFixed(0)} GB` },
+}
+
+// Self-reported, both sides -- see api/server.js's checkHardwareMismatch
+// for why this can never be a security check (a dishonest operator can
+// make both numbers agree by lying consistently). This exists to catch an
+// HONEST drift: upgraded hardware without updating the listing, a typo at
+// enrollment, a swapped GPU -- so it's framed as a listing discrepancy for
+// the provider to fix, not an accusation.
+function HardwareMismatchNotice({ mismatches }) {
+  return (
+    <div className="mt-2 rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800">
+      <div className="font-medium">Listing doesn't match what this node reports:</div>
+      <ul className="mt-1 space-y-0.5">
+        {mismatches.map((m) => {
+          const field = MISMATCH_FIELD[m.field] ?? { label: m.field, format: (v) => v }
+          return (
+            <li key={m.field}>
+              {field.label}: listed {field.format(m.declared)}, node reports {field.format(m.reported)}
+            </li>
+          )
+        })}
+      </ul>
     </div>
   )
 }
