@@ -8,10 +8,13 @@
 //
 // HONEST LIMIT: this is in-memory, per-process state. Correct for the
 // single backend instance this MVP actually runs; wrong the moment a
-// second instance joins without a shared store. Redis is already in
-// docker-compose.yml and unused everywhere else in this codebase -- it
-// would be the natural place to move this once horizontal scaling is
-// real, not something to build ahead of that need.
+// second instance joins without a shared store. ws/clusterRelay.js has
+// since taken the Hub through exactly this same in-memory-to-Redis move
+// for cross-instance node routing -- this module would follow the same
+// pattern (a Redis-backed counter instead of the local Map below) if and
+// when rate limiting specifically needs to survive a second instance;
+// not built ahead of that need, since a per-instance limit is still a
+// real (if weaker) limit today, not a no-op.
 //
 // Thresholds below are illustrative starting points, not researched
 // constants -- the same posture jobs/verification.js's thresholds take.

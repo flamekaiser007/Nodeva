@@ -37,6 +37,18 @@ jobs:
           --health-interval 2s
           --health-timeout 3s
           --health-retries 20
+      # For ws/clusterRelay.test.js -- without this, that file's tests
+      # skip (same self-skip pattern as the Postgres-backed suites when the
+      # database isn't reachable), so cross-instance routing would never
+      # actually run in CI.
+      redis:
+        image: redis:7-alpine
+        ports: ["6380:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
     env:
       DATABASE_URL: postgresql://nodeva:nodeva_dev@localhost:5433/nodeva
       JWT_SECRET: ${{ github.run_id }}-${{ github.run_attempt }}-ci-only-not-a-real-secret-pad-to-32-chars

@@ -570,6 +570,54 @@ Phase 1, early. What exists and is tested:
   itself is unchanged; e2e_demo.sh and the worker suite (48 tests) both
   green.
 
+- **Cross-instance routing for the Hub, closing its single-process gap.**
+  `hub.js` has always kept every worker's live WebSocket connection in that
+  one process's memory (a plain `Map`) -- a real deployment running more
+  than one backend instance behind a load balancer could have an HTTP
+  request land on an instance with no local socket to a node that is
+  genuinely online, and see it as offline for no real reason.
+  `ws/clusterRelay.js` closes this using the Redis this project has always
+  shipped unused in `docker-compose.yml`: every instance broadcasts its own
+  connect/disconnect events over pub/sub, keeping a live map of "which
+  instance holds node X" without a Redis round trip per `isOnline()` call;
+  a node-facing method (`requestReservation`, `submitJob`,
+  `commitReservation`, `queryReservationStatus`, `releaseReservation`)
+  called for a node held by ANOTHER instance gets relayed there and back,
+  correlated by id, indistinguishable to the caller from a local call. A
+  newly started instance also can't know about nodes that connected to
+  peers before it existed from broadcasts alone, so it requests a one-time
+  snapshot from every peer at attach time.
+
+  **Off by default**: activated only when `REDIS_URL` is set
+  (`api/server.js`); unset, `attachClusterRelay` returns the bare `Hub`
+  completely untouched -- same posture as `ALLOW_MANUAL_SETTLEMENT`,
+  `ADMIN_TOKEN`, and the image allowlist. Every existing test, and the
+  single-instance deployment this MVP actually runs, is byte-identical to
+  before this existed.
+
+  **A real, reproducible race caught while writing its own tests, not
+  found later**: the first version used fixed, unnamespaced Redis channel
+  names, and sibling test cases in the same file raced each other's
+  presence broadcasts -- an intermittent failure that reproduced running
+  the full test file but never a single test in isolation, exactly the
+  signature of shared-channel cross-talk rather than a logic bug. Fixed by
+  namespacing every channel (default `'nodeva'`, override via a
+  `namespace` option) -- which also protects an unrelated real deployment
+  sharing one Redis instance from a completely different NODEVA cluster.
+
+  Verified two ways: `clusterRelay.test.js` runs two real Hub instances
+  against a real Redis (`docker-compose.yml`'s `redis` service, also now
+  in CI) proving relay, presence, disconnect propagation, NodeOffline for
+  a node online nowhere, and the startup snapshot exchange. Then verified
+  live against **two separate, real backend OS processes** (ports 3100 and
+  3101) sharing one Postgres and one Redis, with a real Python worker
+  connected ONLY to the first: booked a reservation, confirmed it, and
+  submitted a job entirely through the SECOND process's HTTP API, and
+  watched the real worker's own log show it receiving and acting on all
+  three -- proof the relay works across genuinely separate processes, not
+  just two objects in one Node runtime. Backend suite (246 tests, +6),
+  worker suite (48), frontend suite (30), and e2e_demo.sh all green.
+
 Not built yet: P2P discovery beyond one platform-worker link. This is
 Phase 2 scope per the master brief's own phasing ("Phase 1 doesn't need
 libp2p, and shouldn't have it") and is deliberately not started early.

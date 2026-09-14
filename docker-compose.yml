@@ -14,9 +14,18 @@ services:
       timeout: 3s
       retries: 20
 
+  # Used by backend/src/ws/clusterRelay.js for cross-instance Hub routing --
+  # set REDIS_URL=redis://localhost:6380 to enable it locally. Off by
+  # default (unset REDIS_URL): the single-instance deployment this MVP
+  # actually runs never touches this service at all.
   redis:
     image: redis:7-alpine
     ports: ["6380:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
 
 volumes:
   pgdata:

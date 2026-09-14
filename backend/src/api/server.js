@@ -10,6 +10,7 @@ import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import crypto from 'node:crypto';
 import { Hub, NodeOffline, NodeRefused, NodeTimeout } from '../ws/hub.js';
+import { attachClusterRelay } from '../ws/clusterRelay.js';
 import { admitReceipt } from '../lib/verify.js';
 import { searchCandidates } from '../marketplace/nodeStore.js';
 import { rank } from '../marketplace/scheduler.js';
@@ -118,7 +119,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
   // within 15s of a node reconnecting.
   const heartbeats = new Map(); // node_id -> { gpu, live_reservations, received_at }
 
-  const hub = new Hub({
+  const rawHub = new Hub({
     lookupPublicKey: async (nodeId) => {
       const { rows } = await pool.query(
         'SELECT public_key FROM compute_nodes WHERE node_id = $1', [nodeId]);
@@ -209,6 +210,13 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
       }
     },
   });
+
+  // Cross-instance routing (ws/clusterRelay.js) -- a no-op wrapper that
+  // hands back `rawHub` unchanged when REDIS_URL is unset, which is every
+  // existing test and the single-instance deployment this MVP actually
+  // runs today. See that module's file header for what this closes and why
+  // it's off by default.
+  const hub = attachClusterRelay(rawHub, { redisUrl: process.env.REDIS_URL });
 
   // --- auth ------------------------------------------------------------
 
