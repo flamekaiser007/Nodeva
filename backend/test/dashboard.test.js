@@ -418,3 +418,86 @@ test('enrolling a node with a public key that is already registered gives a clea
   assert.doesNotMatch(secondBody.error, /constraint|pg-pool|duplicate key value/,
     'must not leak the raw Postgres error message to the client');
 });
+
+// --- presence must never resurrect a retired node ------------------------
+
+test('a retired node stays retired even after its worker disconnects and reconnects', { skip }, async () => {
+  // Real, live-caught bug: onPresence unconditionally wrote 'online'/
+  // 'offline' on every connect/disconnect, so a retired ('draining') node
+  // whose worker process was still running (or simply reconnected after a
+  // network blip) got silently resurrected back into search results and
+  // "My Machines" the moment it reconnected.
+  const { token } = await signup('Resurrection Provider');
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+  const kp = keypair();
+  const { node_id } = await (await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' },
+    body: JSON.stringify({
+      public_key_hex: kp.raw.toString('hex'), gpu_model: 'RTX 4090',
+      gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+    }),
+  })).json();
+
+  const firstConnection = new MinimalWorker(node_id, kp);
+  await firstConnection.connect(hub);
+
+  const retireRes = await fetch(`${base}/nodes/${node_id}/retire`, { method: 'POST', headers: authed(token) });
+  assert.equal(retireRes.status, 200);
+
+  // Disconnect (fires onPresence(false)) and reconnect with a FRESH socket
+  // using the same identity (fires onPresence(true)) -- exactly what a
+  // real worker process does on a network blip or restart.
+  firstConnection.sock.close();
+  await tick();
+  const secondConnection = new MinimalWorker(node_id, kp);
+  await secondConnection.connect(hub);
+  await tick();
+
+  const row = await pool.query('SELECT status FROM compute_nodes WHERE node_id=$1', [node_id]);
+  assert.equal(row.rows[0].status, 'draining', 'reconnecting must not resurrect a retired node');
+
+  const dash = await (await fetch(`${base}/providers/me/dashboard`, { headers: authed(token) })).json();
+  assert.equal(dash.nodes.find((n) => n.node_id === node_id), undefined,
+    'still must not appear in "My Machines" after the worker reconnects');
+});
+
+// --- enrollment field validation (0 or negative values) -----------------
+
+test('enrolling a node with gpu_vram_mb: 0 gives a clean 400, not a raw 500', { skip }, async () => {
+  // Real, live-caught case: a CPU-only machine's hardware.py detection
+  // correctly reports gpu_vram_gb: null (no NVIDIA GPU -- true for a
+  // CPU-only box, a Mac, or an AMD card), which a provider then left as
+  // 0 in the form. Postgres's own CHECK (gpu_vram_mb > 0) rejected the
+  // INSERT with a raw constraint-violation message before this validation
+  // existed.
+  const { token } = await signup('Zero VRAM Provider');
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+  const res = await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' },
+    body: JSON.stringify({
+      public_key_hex: crypto.randomBytes(32).toString('hex'), gpu_model: 'Apple silicon',
+      gpu_vram_mb: 0, cpu_cores: 8, ram_mb: 8192, price_paise_hr: 4300,
+    }),
+  });
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assert.match(body.error, /gpu_vram_mb must be greater than 0/);
+});
+
+test('the same validation applies to cpu_cores, ram_mb, and price_paise_hr', { skip }, async () => {
+  const { token } = await signup('Other Zero Fields Provider');
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+  const base_node = {
+    public_key_hex: crypto.randomBytes(32).toString('hex'), gpu_model: 'RTX 4090',
+    gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+  };
+  for (const [field, badValue] of [['cpu_cores', 0], ['ram_mb', -1], ['price_paise_hr', 0]]) {
+    const res = await fetch(`${base}/nodes`, {
+      method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' },
+      body: JSON.stringify({ ...base_node, public_key_hex: crypto.randomBytes(32).toString('hex'), [field]: badValue }),
+    });
+    assert.equal(res.status, 400, `expected 400 for ${field}=${badValue}`);
+    const body = await res.json();
+    assert.match(body.error, new RegExp(`${field} must be greater than 0`));
+  }
+});

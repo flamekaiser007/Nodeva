@@ -150,8 +150,16 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
       return rows[0]?.public_key ?? null;
     },
     onPresence: async (nodeId, online) => {
+      // AND status <> 'draining' -- a real, live-caught bug: without this
+      // guard, a retired node's own worker reconnecting (or even just its
+      // existing connection dropping and picking back up) unconditionally
+      // stomped 'draining' back to 'online'/'offline', resurrecting a node
+      // the provider had just removed. Retiring (POST /nodes/:id/retire)
+      // is meant to be a terminal state until something explicitly
+      // un-retires it -- nothing does yet -- so presence events must never
+      // be the thing that undoes it.
       await pool.query(
-        "UPDATE compute_nodes SET status = $2, last_seen_at = now() WHERE node_id = $1",
+        "UPDATE compute_nodes SET status = $2, last_seen_at = now() WHERE node_id = $1 AND status <> 'draining'",
         [nodeId, online ? 'online' : 'offline'],
       ).catch(() => {}); // presence bookkeeping must never crash the socket layer
     },
@@ -523,6 +531,21 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
       const pub = Buffer.from(public_key_hex, 'hex');
       if (pub.length !== 32) {
         return res.status(400).json({ error: 'public_key_hex must decode to 32 bytes' });
+      }
+      // Every one of these columns has its own CHECK (... > 0) (migrations/
+      // 001_init.sql) -- validated here, per-field, so the error actually
+      // says which one is wrong, rather than letting Postgres reject the
+      // INSERT and leaking a raw constraint-violation message. Real,
+      // live-caught case: a CPU-only machine's hardware.py detection
+      // correctly reports gpu_vram_gb: null (no discrete GPU, e.g. Apple
+      // Silicon), which the enrollment form left as 0 when typed in --
+      // and 0 is exactly as invalid as a negative number here, since this
+      // is a GPU marketplace and a "0 VRAM GPU" is not a real listing.
+      const positiveFields = { gpu_vram_mb, cpu_cores, ram_mb, price_paise_hr };
+      for (const [field, value] of Object.entries(positiveFields)) {
+        if (!(Number(value) > 0)) {
+          return res.status(400).json({ error: `${field} must be greater than 0` });
+        }
       }
       const { rows } = await pool.query(
         `INSERT INTO compute_nodes

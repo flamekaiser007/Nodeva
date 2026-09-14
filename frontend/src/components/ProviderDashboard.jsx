@@ -295,6 +295,7 @@ function EnrollNodeForm({ onEnrolled }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
   const [detected, setDetected] = useState(null) // which fields the pasted JSON actually filled in, for the confirmation note below
+  const [noGpuDetected, setNoGpuDetected] = useState(false) // real hardware.py output, gpu_model: null -- worth explaining, not a silent blank
 
   // The CLI snippet below prints a JSON blob (public key + real detected
   // hardware, see worker/nodeva_worker/hardware.py's describe_this_machine)
@@ -319,6 +320,12 @@ function EnrollNodeForm({ onEnrolled }) {
     if (parsed.cpu_cores != null) { setCores(String(parsed.cpu_cores)); filled.push('CPU cores') }
     if (parsed.ram_gb != null) { setRam(String(parsed.ram_gb)); filled.push('RAM') }
     setDetected(filled)
+    // hardware.py's own honest-unknown posture: gpu_model: null means the
+    // worker genuinely found no nvidia-smi-visible GPU on this machine
+    // (a CPU-only box, or a non-NVIDIA GPU like Apple Silicon or an AMD
+    // card -- nvidia-smi can't see either). Worth saying outright, since
+    // leaving GPU model blank with no explanation just looks broken.
+    setNoGpuDetected('gpu_model' in parsed && parsed.gpu_model == null)
   }
 
   async function submit(e) {
@@ -344,14 +351,22 @@ function EnrollNodeForm({ onEnrolled }) {
   return (
     <form onSubmit={submit} className="grid gap-3 rounded-lg border border-neutral-200 bg-white p-4">
       <p className="text-xs text-neutral-500">
-        Run the Compute Worker on the machine you're sharing and paste its
-        output below (the worker generates and keeps the private key -- it
-        never leaves that machine). This also detects and fills in your
-        real GPU model, VRAM, CPU cores, and RAM below, so you don't have
-        to type them in by hand:
+        From the <code>NODEVA</code> project folder you cloned on the
+        machine you're sharing, set up the worker's environment ONCE:
       </p>
       <pre className="overflow-x-auto rounded bg-neutral-900 p-2 text-xs text-neutral-100">
-{`python -c "
+{`python3 -m venv .venv
+.venv/bin/pip install -r worker/requirements.txt`}
+      </pre>
+      <p className="text-xs text-neutral-500">
+        Then run this and paste its output below (the worker generates and
+        keeps the private key -- it never leaves that machine). This also
+        detects and fills in your real GPU model, VRAM, CPU cores, and
+        RAM, so you don't have to type them in by hand:
+      </p>
+      <pre className="overflow-x-auto rounded bg-neutral-900 p-2 text-xs text-neutral-100">
+{`.venv/bin/python -c "
+import sys; sys.path.insert(0, 'worker')
 import json
 from pathlib import Path
 from nodeva_worker.identity import NodeIdentity
@@ -369,13 +384,22 @@ print(json.dumps({'public_key_hex': ident.public_key_raw().hex(), **describe_thi
           below before enrolling.
         </p>
       )}
+      {noGpuDetected && (
+        <p className="text-xs text-amber-700">
+          ⚠ No NVIDIA GPU was detected on this machine (nvidia-smi found
+          nothing -- true for a CPU-only box, and also for a Mac or an AMD
+          card, which nvidia-smi can't see either way). This marketplace
+          currently lists NVIDIA GPUs only, so GPU model and VRAM need a
+          real value greater than 0 to enroll.
+        </p>
+      )}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <LabeledInput label="GPU model" value={gpuModel} onChange={setGpuModel} placeholder="e.g. RTX 4090" required />
-        <LabeledInput label="VRAM (GB)" type="number" value={vram} onChange={setVram} placeholder="e.g. 24" required />
-        <LabeledInput label="CPU cores" type="number" value={cores} onChange={setCores} placeholder="e.g. 16" required />
-        <LabeledInput label="RAM (GB)" type="number" value={ram} onChange={setRam} placeholder="e.g. 32" required />
+        <LabeledInput label="VRAM (GB)" type="number" min="1" value={vram} onChange={setVram} placeholder="e.g. 24" required />
+        <LabeledInput label="CPU cores" type="number" min="1" value={cores} onChange={setCores} placeholder="e.g. 16" required />
+        <LabeledInput label="RAM (GB)" type="number" min="1" value={ram} onChange={setRam} placeholder="e.g. 32" required />
       </div>
-      <LabeledInput label="Price (₹/hr)" type="number" value={price} onChange={setPrice} placeholder="e.g. 43" required />
+      <LabeledInput label="Price (₹/hr)" type="number" min="1" step="0.01" value={price} onChange={setPrice} placeholder="e.g. 43" required />
       {error && <div className="text-sm text-red-600">{error}</div>}
       <button disabled={busy}
         className="rounded bg-neutral-800 px-4 py-2 font-medium text-white hover:bg-neutral-900 disabled:opacity-50">
@@ -385,12 +409,12 @@ print(json.dumps({'public_key_hex': ident.public_key_raw().hex(), **describe_thi
   )
 }
 
-function LabeledInput({ label, value, onChange, type = 'text', placeholder, required }) {
+function LabeledInput({ label, value, onChange, type = 'text', placeholder, required, min, step }) {
   return (
     <label className="text-sm">
       <span className="font-medium text-neutral-600">{label}</span>
       <input type={type} value={value} onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder} required={required}
+        placeholder={placeholder} required={required} min={min} step={step}
         className="mt-1 w-full rounded border border-neutral-300 px-2 py-1" />
     </label>
   )

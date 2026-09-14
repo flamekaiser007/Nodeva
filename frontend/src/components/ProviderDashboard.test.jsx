@@ -202,3 +202,46 @@ test('a refused retire (409, e.g. a live reservation) shows the real error, not 
   expect(await screen.findByText(/live reservation/i)).toBeInTheDocument()
   expect(screen.getByText('RTX 4090')).toBeInTheDocument() // the node is still listed -- nothing was removed
 })
+
+// --- no-GPU-detected messaging ------------------------------------------
+// Regression coverage: hardware.py's describe_this_machine() correctly
+// reports gpu_model: null on a CPU-only machine (or a Mac/AMD card
+// nvidia-smi can't see) -- a real user's own Apple Silicon MacBook Air hit
+// this and had no idea why GPU model stayed blank, then submitted VRAM: 0
+// and got a raw "internal_error" back (fixed server-side too; see
+// dashboard.test.js's gpu_vram_mb validation tests).
+
+test('pasting a blob with gpu_model: null shows a clear explanation, not a silent blank', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithNoNodes())
+  render(<ProviderDashboard />)
+  fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
+
+  const blob = JSON.stringify({
+    public_key_hex: 'f'.repeat(64),
+    gpu_model: null, gpu_vram_gb: null, cpu_cores: 8, ram_gb: 8,
+  })
+  fireEvent.change(screen.getByPlaceholderText("paste the command's output here"), { target: { value: blob } })
+
+  expect(screen.getByText(/no nvidia gpu was detected/i)).toBeInTheDocument()
+})
+
+test('the VRAM/CPU/RAM/price fields reject 0 client-side (min=1), so a CPU-only paste cannot be submitted with a fabricated 0', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithNoNodes())
+  render(<ProviderDashboard />)
+  fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
+
+  expect(screen.getByLabelText('VRAM (GB)')).toHaveAttribute('min', '1')
+  expect(screen.getByLabelText('CPU cores')).toHaveAttribute('min', '1')
+  expect(screen.getByLabelText('RAM (GB)')).toHaveAttribute('min', '1')
+  expect(screen.getByLabelText('Price (₹/hr)')).toHaveAttribute('min', '1')
+})
+
+test('a bare hex paste (no JSON) does not show the no-GPU warning -- nothing was actually detected either way', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithNoNodes())
+  render(<ProviderDashboard />)
+  fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
+
+  fireEvent.change(screen.getByPlaceholderText("paste the command's output here"), { target: { value: 'a'.repeat(64) } })
+
+  expect(screen.queryByText(/no nvidia gpu was detected/i)).not.toBeInTheDocument()
+})
