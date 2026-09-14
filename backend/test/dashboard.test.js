@@ -392,7 +392,7 @@ test('retiring a node with a live reservation is refused, not silently orphaning
 
 // --- re-enrolling with an already-registered public key -----------------
 
-test('enrolling a node with a public key that is already registered gives a clean 409, not a raw 500', { skip }, async () => {
+test('re-enrolling with a key that is still an ACTIVE listing is refused, not silently duplicated', { skip }, async () => {
   const { token } = await signup('Duplicate Key Provider');
   await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
   const publicKeyHex = crypto.randomBytes(32).toString('hex');
@@ -408,15 +408,81 @@ test('enrolling a node with a public key that is already registered gives a clea
   // Exactly the real-world scenario the NodeIdentity ~-expansion bug used
   // to cause: re-running the enrollment CLI snippet is now correctly
   // idempotent about which key it returns, so re-enrolling the SAME
-  // physical machine hits this constraint for real.
+  // physical machine hits this constraint for real -- but this node is
+  // still 'enrolling' (never retired), so it must stay a hard conflict,
+  // not silently reactivate an unrelated live listing.
   const second = await fetch(`${base}/nodes`, {
     method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' }, body,
   });
   assert.equal(second.status, 409);
   const secondBody = await second.json();
-  assert.match(secondBody.error, /already enrolled/);
+  assert.match(secondBody.error, /already have an active listing/);
   assert.doesNotMatch(secondBody.error, /constraint|pg-pool|duplicate key value/,
     'must not leak the raw Postgres error message to the client');
+});
+
+test('re-enrolling with a key from a DIFFERENT provider is refused with a generic message', { skip }, async () => {
+  const a = await signup('Key Owner A');
+  const b = await signup('Key Claimer B');
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(a.token) });
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(b.token) });
+  const publicKeyHex = crypto.randomBytes(32).toString('hex');
+  const bodyFor = (token) => JSON.stringify({
+    public_key_hex: publicKeyHex, gpu_model: 'RTX 4090',
+    gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+  });
+  await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(a.token), 'content-type': 'application/json' }, body: bodyFor(a.token),
+  });
+
+  const res = await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(b.token), 'content-type': 'application/json' }, body: bodyFor(b.token),
+  });
+  assert.equal(res.status, 409);
+  const resBody = await res.json();
+  // Deliberately generic -- must not confirm whose it is or what state
+  // it's in to someone who doesn't own it.
+  assert.doesNotMatch(resBody.error, /active listing|retire/);
+});
+
+test('re-enrolling a RETIRED node with the same key reactivates it with the new specs, not a 409', { skip }, async () => {
+  // The actual gap this closes: retiring (POST /nodes/:id/retire) never
+  // freed up the public key, so once a machine's identity is correctly
+  // stable (the ~-expansion fix), that exact physical machine could never
+  // re-enroll again, ever -- a real user hit this live, retiring their
+  // one real node and then being unable to bring it back.
+  const { token } = await signup('Reactivation Provider');
+  await fetch(`${base}/providers/me`, { method: 'POST', headers: authed(token) });
+  const publicKeyHex = crypto.randomBytes(32).toString('hex');
+  const enrollRes = await (await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' },
+    body: JSON.stringify({
+      public_key_hex: publicKeyHex, gpu_model: 'Old GPU Name',
+      gpu_vram_mb: 8192, cpu_cores: 4, ram_mb: 8192, price_paise_hr: 1000,
+    }),
+  })).json();
+  const originalNodeId = enrollRes.node_id;
+
+  const retireRes = await fetch(`${base}/nodes/${originalNodeId}/retire`, { method: 'POST', headers: authed(token) });
+  assert.equal(retireRes.status, 200);
+
+  const reactivateRes = await fetch(`${base}/nodes`, {
+    method: 'POST', headers: { ...authed(token), 'content-type': 'application/json' },
+    body: JSON.stringify({
+      public_key_hex: publicKeyHex, gpu_model: 'RTX 4090 (Upgraded)',
+      gpu_vram_mb: 24576, cpu_cores: 16, ram_mb: 32768, price_paise_hr: 4300,
+    }),
+  });
+  assert.equal(reactivateRes.status, 200);
+  const reactivateBody = await reactivateRes.json();
+  assert.equal(reactivateBody.node_id, originalNodeId, 'the SAME row is reactivated, not a second one created');
+  assert.equal(reactivateBody.reactivated, true);
+
+  const dash = await (await fetch(`${base}/providers/me/dashboard`, { headers: authed(token) })).json();
+  const node = dash.nodes.find((n) => n.node_id === originalNodeId);
+  assert.ok(node, 'must be back in "My Machines" -- no longer draining');
+  assert.equal(node.gpu_model, 'RTX 4090 (Upgraded)', 'the fresh specs from re-enrollment must have taken effect');
+  assert.equal(node.status, 'enrolling', 'a reactivated node starts at "enrolling", same as a brand new one');
 });
 
 // --- presence must never resurrect a retired node ------------------------

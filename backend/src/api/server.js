@@ -547,6 +547,44 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
           return res.status(400).json({ error: `${field} must be greater than 0` });
         }
       }
+
+      // compute_nodes.public_key is UNIQUE, and a real, live-caught gap
+      // followed directly from that: retiring a node (POST
+      // /nodes/:id/retire) never freed up its key, so once the
+      // ~-expansion fix (identity.py) made a machine's identity correctly
+      // STABLE across runs, retiring became a one-way trap -- the exact
+      // same physical machine could never re-enroll, ever, because its
+      // own retired row still owned the key forever. A public key
+      // identifies a physical machine, not a single listing's lifetime;
+      // re-enrolling a machine you already own and already retired should
+      // reactivate that listing with the fresh specs, not be rejected.
+      const existing = await pool.query(
+        'SELECT node_id, provider_id, status FROM compute_nodes WHERE public_key = $1', [pub]);
+      if (existing.rows[0]) {
+        const conflict = existing.rows[0];
+        if (conflict.provider_id !== providerRow.rows[0].provider_id) {
+          // Deliberately the same generic message regardless of whose it
+          // is or what state it's in -- confirming another account
+          // already holds this exact key is itself information a caller
+          // has no legitimate reason to get more specific about.
+          return res.status(409).json({ error: 'a node with this public key is already enrolled' });
+        }
+        if (conflict.status !== 'draining') {
+          return res.status(409).json({
+            error: 'you already have an active listing with this public key -- ' +
+              'retire it first (POST /nodes/:id/retire) if you want to replace it',
+          });
+        }
+        await pool.query(
+          `UPDATE compute_nodes
+              SET gpu_model = $2, gpu_vram_mb = $3, cpu_cores = $4, ram_mb = $5,
+                  price_paise_hr = $6, cuda_version = $7, status = 'enrolling'
+            WHERE node_id = $1`,
+          [conflict.node_id, gpu_model, gpu_vram_mb, cpu_cores, ram_mb,
+           price_paise_hr, cuda_version ?? null]);
+        return res.status(200).json({ node_id: conflict.node_id, reactivated: true });
+      }
+
       const { rows } = await pool.query(
         `INSERT INTO compute_nodes
            (provider_id, public_key, gpu_model, gpu_vram_mb, cpu_cores, ram_mb,
@@ -556,21 +594,13 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
          price_paise_hr, cuda_version ?? null]);
       res.status(201).json({ node_id: rows[0].node_id });
     } catch (e) {
-      // compute_nodes.public_key is UNIQUE -- hit in practice by exactly
-      // the scenario the NodeIdentity ~-expansion bug (identity.py) used
-      // to cause: re-running the enrollment CLI snippet is now correctly
-      // idempotent about WHICH key it returns, so a provider re-enrolling
-      // the same physical machine (retried after a failed attempt, or
-      // just running the snippet again to double-check) gets the exact
-      // same public key back and hits this constraint. A raw 500 with a
-      // leaked Postgres error message here was a real, live-caught rough
-      // edge -- this is the same clean-error pattern already used for
-      // /auth/signup's UNIQUE(email).
+      // Still possible under a genuine race (two concurrent enrollment
+      // requests for the same brand-new key) even with the pre-check
+      // above -- the SELECT-then-branch above is not atomic with the
+      // INSERT. A raw 500 leaking the Postgres message here was the
+      // original live-caught rough edge; kept as a last-resort net.
       if (e.code === '23505') {
-        return res.status(409).json({
-          error: 'a node with this public key is already enrolled -- if it should be a new listing, ' +
-            'retire the old one first (POST /nodes/:id/retire) or generate a fresh identity',
-        });
+        return res.status(409).json({ error: 'a node with this public key is already enrolled' });
       }
       next(e);
     }
