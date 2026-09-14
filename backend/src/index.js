@@ -4,6 +4,7 @@ import { createApp, attachWebSocketServer } from './api/server.js';
 import { expireStaleHolds, reconcileExpiredMismatches } from './reservations/reconciler.js';
 import { processRefundRetries } from './payments/refunds.js';
 import { logger } from './observability/logger.js';
+import { refreshBacklogGauges } from './observability/backlog.js';
 
 const pool = createPool();
 const { app, hub, paymentGateway } = createApp(pool);
@@ -41,6 +42,16 @@ setInterval(() => {
 // configured, since there is nothing to retry against.
 setInterval(() => {
   processRefundRetries(pool, paymentGateway).catch((e) => logger.error('refund retry sweep failed', { error: e }));
+}, 30_000);
+
+// Keeps the backlog gauges (observability/metrics.js) fresh for whoever
+// scrapes /metrics -- a snapshot query, same cadence as the refund retry
+// sweep since they read overlapping tables. Failing to refresh must not
+// crash the process; a stale gauge value for 30s is a far smaller problem
+// than the backend going down over an observability query.
+refreshBacklogGauges(pool).catch((e) => logger.error('backlog gauge refresh failed', { error: e }));
+setInterval(() => {
+  refreshBacklogGauges(pool).catch((e) => logger.error('backlog gauge refresh failed', { error: e }));
 }, 30_000);
 
 const port = process.env.PORT ?? 3000;

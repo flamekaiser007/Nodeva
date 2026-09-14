@@ -77,6 +77,26 @@ export const refundRetriesExhaustedTotal = new client.Counter({
   registers: [registry],
 });
 
+// Gauges, not counters: a backlog is CURRENT state ("how many right now"),
+// not a running total of events -- refreshed periodically by
+// observability/backlog.js against the same queries admin/ops-summary
+// already runs, rather than incremented at a call site like the counters
+// above. This is what alerting/alert_rules.yml actually pages on: a
+// counter only rising forever tells you nothing about whether today's
+// backlog is fine or an emergency, since it never goes down.
+export const refundRetriesPendingGauge = new client.Gauge({
+  name: 'nodeva_refund_retries_pending',
+  help: 'Refund retries currently in each status (a snapshot, not cumulative).',
+  labelNames: ['status'],
+  registers: [registry],
+});
+
+export const disputesAwaitingTiebreakGauge = new client.Gauge({
+  name: 'nodeva_disputes_awaiting_tiebreak',
+  help: 'Disputed verification groups with no dispute_resolutions row yet -- the backlog a human tiebreak decision is needed for.',
+  registers: [registry],
+});
+
 // Express middleware: records one HTTP request's count and duration once
 // the response finishes. Uses the matched Express ROUTE pattern (e.g.
 // '/reservations/:id/jobs'), not req.path/req.originalUrl, so a UUID in

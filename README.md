@@ -721,6 +721,57 @@ Phase 1, early. What exists and is tested:
   suite is now 59 tests (44 passing, 15 skipped without a live GPU/network
   dependency).
 
+- **Alerting on the metrics that already existed.** `/metrics` has been
+  scrapeable since the structured-logging work, but nothing was consuming
+  it -- an operator had to remember to look. Adds two Gauges
+  (`observability/backlog.js`): `nodeva_refund_retries_pending` (labeled by
+  status) and `nodeva_disputes_awaiting_tiebreak`, refreshed every 30s by a
+  new periodic sweep in `index.js`, reusing the EXACT queries
+  `GET /admin/ops-summary` already runs so the two can never quietly drift
+  apart. A gauge, not a counter -- these answer "how bad is it right now",
+  which a monotonically-increasing counter structurally cannot.
+
+  `alerting/` holds real Prometheus config (`prometheus.yml`) and real
+  alert rules (`alert_rules.yml`): `NodevaBackendDown`, an immediate
+  `NodevaRefundRetriesExhausted` (any increase at all -- even one is a real
+  user owed real money), `NodevaRefundRetriesBacklogGrowing` and
+  `NodevaDisputesAwaitingTiebreakBacklog` (sustained backlog, not a
+  one-time blip), and `NodevaHighServerErrorRate` off the HTTP metrics that
+  already existed. `alertmanager.yml` routes all of them to a webhook.
+  Both services are wired into `docker-compose.yml` behind an
+  `observability` compose profile -- off by default, the same posture as
+  `redis` before `clusterRelay.js` needed it; opt in with
+  `docker compose --profile observability up -d prometheus alertmanager`.
+
+  Caught two real bugs live, both through `scripts/alerting_demo.sh` (a
+  real backend, a real Prometheus container, a real Alertmanager container,
+  and a real webhook receiver -- not a config file nobody had ever actually
+  loaded):
+  1. The backlog gauge tests (`backend/test/backlog.test.js`) initially
+     asserted absolute counts against this project's shared, long-lived dev
+     Postgres, which already carried rows from every earlier test run this
+     session -- failed with `8 !== 1` the first time it ran after
+     `refunds.test.js` had left rows behind. Fixed by asserting deltas
+     (before vs. after this test's own action) instead, the same shape
+     every other test file in this suite that shares that database already
+     has to use.
+  2. `requireAdminToken` (`auth/adminToken.js`) only ever checked the bare
+     `x-admin-token` header -- but Prometheus's own `bearer_token` scrape
+     option (what `alerting/prometheus.yml` actually uses) sends a standard
+     `Authorization: Bearer <token>` header, which this middleware had
+     never looked at. A real Prometheus container scraping a real running
+     backend got a real 404 on every attempt until this was fixed to accept
+     either header shape. The `/metrics` file comment already claimed
+     Prometheus's bearer_token "authenticates against it like any other
+     client" -- that claim was aspirational, not true, until this fix made
+     it true.
+
+  6 new backlog.test.js tests, 4 new adminToken.test.js tests. Backend
+  suite is now 276 tests. Verified live end-to-end via
+  `scripts/alerting_demo.sh`: killed a real backend process and watched a
+  real `NodevaBackendDown` alert travel Prometheus -> Alertmanager ->
+  webhook, landing a real JSON payload at the receiver.
+
 ## Running
 
 ```bash

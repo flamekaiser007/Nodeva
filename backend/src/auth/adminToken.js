@@ -13,11 +13,28 @@ import crypto from 'node:crypto';
 // route exists) unless ADMIN_TOKEN is set -- the same off-by-default
 // posture as ALLOW_MANUAL_SETTLEMENT. A real deployment sets ADMIN_TOKEN
 // to a long random value and keeps it as secret as the JWT signing key.
+// Accepts either a bare `x-admin-token` header (the original, simplest
+// shape) OR a standard `Authorization: Bearer <token>` header -- the
+// latter is what Prometheus's own `bearer_token` scrape option sends (see
+// alerting/prometheus.yml), and a real, live-caught bug the first version
+// of this middleware had: /metrics's own file comment in api/server.js
+// claimed a Prometheus bearer_token scrape would "authenticate against it
+// like any other client", but this function only ever checked
+// `x-admin-token` -- a real Prometheus container scraping a real running
+// backend got a real 404 every time until this was fixed.
+function extractProvidedToken(req) {
+  const bare = req.get('x-admin-token');
+  if (bare) return bare;
+  const auth = req.get('authorization') ?? '';
+  const match = auth.match(/^Bearer (.+)$/);
+  return match ? match[1] : '';
+}
+
 export function requireAdminToken(req, res, next) {
   const expected = process.env.ADMIN_TOKEN;
   if (!expected) return res.status(404).json({ error: 'not_found' });
 
-  const provided = req.get('x-admin-token') ?? '';
+  const provided = extractProvidedToken(req);
   const expectedBuf = Buffer.from(expected);
   const providedBuf = Buffer.from(provided);
   // timingSafeEqual throws on a length mismatch rather than returning

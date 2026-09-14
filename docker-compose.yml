@@ -27,5 +27,28 @@ services:
       timeout: 3s
       retries: 20
 
+  # Alerting on the metrics observability/metrics.js already exposes (see
+  # alerting/alert_rules.yml). Both services are gated behind the
+  # `observability` profile -- `docker compose up` never starts them;
+  # `docker compose --profile observability up -d prometheus alertmanager`
+  # does. Off by default for the same reason `redis` is: nothing in the
+  # single-instance dev/test path needs it running.
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["observability"]
+    ports: ["9090:9090"]
+    volumes:
+      - ./alerting/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerting/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    profiles: ["observability"]
+    ports: ["9093:9093"]
+    volumes:
+      - ./alerting/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+
 volumes:
   pgdata:

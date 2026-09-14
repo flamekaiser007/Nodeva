@@ -1,0 +1,70 @@
+# Real alerting rules over the metrics observability/metrics.js and
+# observability/backlog.js already expose -- not aspirational, every metric
+# name here is scraped and asserted on by backend/test/metrics.test.js and
+# backend/test/backlog.test.js. Thresholds are illustrative starting
+# points, same honesty as jobs/verification.js's DEFAULT_VERIFICATION_THRESHOLDS
+# -- real values need real production traffic to tune, not a guess made
+# once here.
+groups:
+  - name: nodeva-core
+    rules:
+      - alert: NodevaBackendDown
+        expr: up{job="nodeva-backend"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "nodeva backend is not responding to scrapes"
+          description: "Prometheus has not been able to scrape /metrics for at least 1 minute. Every downstream alert here depends on this one being healthy."
+
+      - alert: NodevaRefundRetriesExhausted
+        # A refund_retries row hitting 'exhausted' (payments/refunds.js) is
+        # the ONE row in this whole system that a human must act on --
+        # everything before it is designed to resolve itself. Fires on any
+        # increase at all, not a threshold: even one exhausted refund is a
+        # real user who is owed real money.
+        expr: increase(nodeva_refund_retries_exhausted_total[15m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "A refund retry has been exhausted -- manual refund required"
+          description: "See GET /admin/ops-summary's refund_retries.exhausted list for the specific payment_id(s). {{ $value }} exhausted in the last 15m."
+
+      - alert: NodevaRefundRetriesBacklogGrowing
+        # Distinct from the above: this is the CURRENT pending count, not a
+        # one-time crossing. A backlog that stays elevated for 10 minutes
+        # suggests the gateway itself is degraded (rate limiting, an
+        # outage), not just one unlucky payment.
+        expr: nodeva_refund_retries_pending{status="pending"} > 5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Refund retry backlog is elevated ({{ $value }} pending)"
+          description: "processRefundRetries (payments/refunds.js) has more than 5 pending retries for 10+ minutes -- check whether the payment gateway itself is degraded."
+
+      - alert: NodevaDisputesAwaitingTiebreakBacklog
+        # Each unresolved verification-group dispute counts as 2 in this
+        # gauge (both original reservations), so a threshold of 4 means
+        # "2 or more distinct disputes sitting unresolved for 10+ minutes"
+        # -- see backend/test/backlog.test.js's own comment on why this
+        # query (shared with GET /admin/ops-summary) counts reservations,
+        # not groups.
+        expr: nodeva_disputes_awaiting_tiebreak > 4
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Dispute tiebreak backlog is elevated ({{ $value }} disputed reservations awaiting a third-node tiebreak)"
+          description: "See GET /admin/ops-summary's disputes.awaiting_tiebreak list. Each disputed reservation already refunded the affected user in full (settleVerificationGroup) -- this backlog is about REPUTATION resolution, not unresolved money."
+
+      - alert: NodevaHighServerErrorRate
+        # The one alert here not backed by a business-specific counter --
+        # httpRequestsTotal already exists for every request regardless of
+        # route, so a spike in 5xx responses is visible without adding
+        # anything new. 5% over 5 minutes is illustrative, same caveat as
+        # the other thresholds above.
+        expr: |
+          sum(rate(nodeva_http_requests_total{status=~"5.."}[5m]))
+          / sum(rate(nodeva_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Over 5% of requests are failing with a 5xx"
+          description: "{{ $value | humanizePercentage }} of requests over the last 5 minutes returned a 5xx status."

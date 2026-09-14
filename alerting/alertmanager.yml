@@ -1,0 +1,20 @@
+# Dev-only Alertmanager config for the observability compose profile.
+# Routes every alert to a single webhook -- see scripts/alerting_demo.sh,
+# which points this at a throwaway local HTTP server it starts itself so
+# the live check has something to actually receive and print a real
+# delivered alert payload. Swap this for a real receiver (Slack, PagerDuty,
+# email) before this is ever pointed at production; the point of this repo
+# is that the wiring is real and testable, not that this exact receiver is
+# production-ready.
+route:
+  receiver: default-webhook
+  group_by: ["alertname"]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+
+receivers:
+  - name: default-webhook
+    webhook_configs:
+      - url: "http://host.docker.internal:9099/alerts"
+        send_resolved: true
