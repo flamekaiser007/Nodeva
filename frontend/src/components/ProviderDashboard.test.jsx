@@ -245,3 +245,48 @@ test('a bare hex paste (no JSON) does not show the no-GPU warning -- nothing was
 
   expect(screen.queryByText(/no nvidia gpu was detected/i)).not.toBeInTheDocument()
 })
+
+// --- surfacing node_id + the run command for an offline node -----------
+// Regression coverage for a real gap: node_id was used internally (React
+// key, the retire API call) but never shown anywhere, even though it's a
+// required argument to actually run the worker (worker/run_worker.py). A
+// provider who enrolled a node had no way to discover the one thing they
+// needed to bring it online.
+
+test('an offline node shows its node_id and the exact run command', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithOneNode({ online: false, status: 'enrolling' }))
+  render(<ProviderDashboard />)
+
+  expect(await screen.findByText('RTX 4090')).toBeInTheDocument()
+  expect(screen.getByText(/node-1/)).toBeInTheDocument()
+  expect(screen.getByText(/run_worker\.py/)).toBeInTheDocument()
+  expect(screen.getByText(/--price-paise-hr 4300/)).toBeInTheDocument()
+})
+
+test('an online node does not show the offline run-command hint', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithOneNode({
+    online: true, heartbeat: { gpu: null, live_reservations: 0 },
+  }))
+  render(<ProviderDashboard />)
+
+  expect(await screen.findByText('RTX 4090')).toBeInTheDocument()
+  expect(screen.queryByText(/run_worker\.py/)).not.toBeInTheDocument()
+})
+
+test('an offline node with a STALE heartbeat from before it disconnected still shows the run command, not the CPU-only text', async () => {
+  // Real, live-caught bug: the backend keeps a node's last heartbeat in
+  // memory forever (api/server.js's `heartbeats` map is never cleared on
+  // disconnect), so a node that had ever reported in before going offline
+  // still arrives here with a non-null `heartbeat`, even though `online`
+  // is false. The branch order used to check `heartbeat` before `online`,
+  // so this exact node fell into the CPU-only branch forever instead of
+  // ever showing the run command.
+  api.providerDashboard.mockResolvedValue(dashboardWithOneNode({
+    online: false, heartbeat: { gpu: null, live_reservations: 0 },
+  }))
+  render(<ProviderDashboard />)
+
+  expect(await screen.findByText('RTX 4090')).toBeInTheDocument()
+  expect(screen.getByText(/run_worker\.py/)).toBeInTheDocument()
+  expect(screen.queryByText(/CPU-only node/)).not.toBeInTheDocument()
+})

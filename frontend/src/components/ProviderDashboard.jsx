@@ -221,13 +221,13 @@ function NodeCard({ node, onRetired }) {
         {(node.gpu_vram_mb / 1024).toFixed(0)} GB VRAM · {node.cpu_cores} cores ·{' '}
         {(node.ram_mb / 1024).toFixed(0)} GB RAM · {paise(node.price_paise_hr)}/hr
       </div>
-      {gpu ? (
+      {node.online && gpu ? (
         <div className="mt-2 flex gap-4 text-xs text-neutral-500">
           <span>GPU util: {gpu.utilization_pct ?? '—'}%</span>
           <span>Free VRAM: {gpu.vram_free_mb != null ? `${(gpu.vram_free_mb / 1024).toFixed(1)} GB` : '—'}</span>
           <span>Temp: {gpu.temperature_c ?? '—'}°C</span>
         </div>
-      ) : node.heartbeat ? (
+      ) : node.online && node.heartbeat ? (
         // A heartbeat DID arrive -- confirmed against the real API response
         // (age_ms present, non-null) -- but its `gpu` field is null, which
         // is the correct, expected shape for a CPU-only worker or one where
@@ -240,7 +240,32 @@ function NodeCard({ node, onRetired }) {
         </div>
       ) : node.online ? (
         <div className="mt-2 text-xs text-neutral-400">waiting for first heartbeat…</div>
-      ) : null}
+      ) : (
+        // node.online now gates all three branches above -- a real,
+        // live-caught bug: the backend's `heartbeats` map (api/server.js)
+        // keeps a node's LAST heartbeat in memory forever, even after it
+        // disconnects, so a node that had ever reported in before going
+        // offline fell into the "CPU-only node" branch above (stale
+        // heartbeat, no online check) instead of ever reaching this one.
+        //
+        // Separately: node_id was never shown anywhere in this UI, but
+        // it's a REQUIRED argument to actually run the worker
+        // (worker/run_worker.py --node-id ...) -- enrolling only ever
+        // registers metadata, nothing shows up online until that separate,
+        // long-lived process is running. Without this, a provider had no
+        // way to discover the one piece of information they need to start it.
+        <div className="mt-2 rounded border border-neutral-200 bg-neutral-50 p-2 text-xs text-neutral-600">
+          <p className="mb-1">
+            Offline. Run this on the machine to bring it online (needs the
+            same identity you enrolled with):
+          </p>
+          <pre className="overflow-x-auto rounded bg-neutral-900 p-2 text-neutral-100">
+{`.venv/bin/python worker/run_worker.py \\
+  --node-id ${node.node_id} \\
+  --price-paise-hr ${node.price_paise_hr}`}
+          </pre>
+        </div>
+      )}
       {node.hardware_mismatch && <HardwareMismatchNotice mismatches={node.hardware_mismatch} />}
     </div>
   )

@@ -138,8 +138,21 @@ class WorkerLink:
         }
 
     async def _heartbeat_loop(self, ws):
+        # A real, live-caught bug (found running run_worker.py as an actual
+        # long-lived process for the first time, not a short-lived test):
+        # _stop_waiter closing `ws` races this loop's own sleep/send cycle.
+        # _message_loop's `async for raw in ws` ends silently when that
+        # happens, but this loop's next ws.send() raises ConnectionClosedOK
+        # instead -- and because both run inside the same TaskGroup
+        # (_session), that one exception turned every clean Ctrl+C shutdown
+        # into an ugly ExceptionGroup traceback. A closed connection here
+        # is exactly as expected an outcome as it is in _message_loop; it
+        # ends this task the same quiet way.
         while True:
-            await ws.send(json.dumps(self._build_heartbeat()))
+            try:
+                await ws.send(json.dumps(self._build_heartbeat()))
+            except websockets.ConnectionClosed:
+                return
             await asyncio.sleep(HEARTBEAT_INTERVAL_S)
 
     async def _message_loop(self, ws):

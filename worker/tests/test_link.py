@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
+import websockets
 from nodeva_worker.link import WorkerLink
 from nodeva_worker.reservations import ReservationStore, HELD, CONFIRMED, RELEASED
 
@@ -197,3 +198,45 @@ def test_peer_info_with_no_dialable_route_is_still_recorded(link):
         "node_id": "node-3", "public_key_hex": "cd" * 32, "host": None, "port": None,
     }))
     assert link.peer_directory.get("node-3")["port"] is None
+
+
+# --- _heartbeat_loop shutdown behavior ----------------------------------
+# Real, live-caught bug: running run_worker.py as an actual long-lived
+# process (not a short-lived test) and stopping it with Ctrl+C produced an
+# ugly ExceptionGroup traceback instead of a clean shutdown. _stop_waiter
+# closing the socket races _heartbeat_loop's own send/sleep cycle, and its
+# next ws.send() raised ConnectionClosedOK straight into the surrounding
+# TaskGroup (_session) -- unlike _message_loop's `async for raw in ws`,
+# which already ends silently on a closed connection.
+
+class ConnectionClosingWs:
+    """A fake ws whose send() raises ConnectionClosedOK after a given
+    number of successful sends -- simulates a heartbeat landing on a
+    connection that closed (deliberately, via _stop_waiter, or otherwise)
+    in between two heartbeat ticks."""
+    def __init__(self, closes_after=0):
+        self.sent = []
+        self._closes_after = closes_after
+
+    async def send(self, raw):
+        if len(self.sent) >= self._closes_after:
+            raise websockets.ConnectionClosedOK(None, None)
+        self.sent.append(json.loads(raw))
+
+
+def test_heartbeat_loop_exits_quietly_when_the_connection_is_already_closed(link):
+    ws = ConnectionClosingWs(closes_after=0)
+    # Must return (a clean task exit), not raise -- run() would surface any
+    # exception the coroutine raises, so this itself is the assertion.
+    run(link._heartbeat_loop(ws))
+
+
+def test_heartbeat_loop_sends_normally_until_the_connection_closes(link, monkeypatch):
+    # HEARTBEAT_INTERVAL_S patched down to 0 so this test doesn't actually
+    # wait 15 real seconds three times over.
+    import nodeva_worker.link as link_module
+    monkeypatch.setattr(link_module, "HEARTBEAT_INTERVAL_S", 0)
+    ws = ConnectionClosingWs(closes_after=3)
+    run(link._heartbeat_loop(ws))
+    assert len(ws.sent) == 3
+    assert all(msg["type"] == "HEARTBEAT" for msg in ws.sent)
