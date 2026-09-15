@@ -60,6 +60,20 @@ def test_root_filesystem_is_read_only():
 def test_workspace_mount_is_writable():
     # The one deliberately writable path. If this fails, jobs cannot produce
     # output at all, which is as serious a bug as the read-only test failing.
+    #
+    # A real, environment-dependent bug this test actually caught in CI
+    # (GitHub Actions, a real Linux Docker host) despite passing locally on
+    # macOS: tempfile.mkdtemp() (executor.py's run_job) defaults to mode
+    # 0700 owned by whoever runs the worker process, but the container
+    # runs as UID 65534 ("nobody", -u 65534:65534 in _start) -- neither
+    # the owner nor in the owning group of a 0700 directory it didn't
+    # create. On a real Linux host that's a permission-denied write,
+    # full stop. It passed on macOS only because Docker Desktop's VM-based
+    # bind-mount sharing doesn't enforce the same host-UID-vs-container-UID
+    # check native Linux does -- meaning this exact class of bug is
+    # invisible to a Mac developer running these tests locally, which is
+    # the whole reason CI running on real Linux runners exists. Fixed by
+    # chmod(0o777) on the workspace dir right after creating it.
     r = run_job(sh("echo produced > /workspace/out.txt && cat /workspace/out.txt"))
     assert r.status == "succeeded"
     assert "produced" in r.stdout

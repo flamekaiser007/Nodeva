@@ -93,6 +93,22 @@ def run_job(spec: JobSpec) -> JobResult:
     _require_docker()
 
     workspace = Path(tempfile.mkdtemp(prefix="nodeva-job-"))
+    # A real, live-caught, environment-dependent bug: tempfile.mkdtemp()
+    # defaults to mode 0700, owned by whoever runs THIS process (root or a
+    # CI runner's own user) -- but the container runs as UID 65534
+    # (nobody), below, on a read-only root filesystem with /workspace as
+    # its ONLY writable path. On a real Linux Docker host, UID 65534 is
+    # neither the owner nor in the group of a 0700 directory it didn't
+    # create, so every job failed to write anything at all. This passed
+    # on macOS (Docker Desktop's VM-based bind-mount sharing doesn't
+    # enforce the same host-UID-vs-container-UID check) and failed the
+    # moment CI ran on a real Linux runner -- caught by
+    # test_workspace_mount_is_writable, which is the one test whose
+    # entire job is to catch exactly this. 0o777 is safe here specifically
+    # because this is a private, randomly-named, single-job directory
+    # deleted immediately after (see the `finally` block below), not
+    # anything long-lived or shared.
+    workspace.chmod(0o777)
     container_id = None
     started = time.monotonic()
     try:
