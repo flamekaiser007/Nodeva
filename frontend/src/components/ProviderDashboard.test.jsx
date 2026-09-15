@@ -84,6 +84,72 @@ test('a fully filled-in form submits the exact typed values, correctly converted
   })
 })
 
+// --- availability window folded into enrollment itself ------------------
+// Regression coverage: a node with zero node_availability rows never
+// appears in search no matter what else matches. Availability used to be
+// a separate step a provider had to remember to do afterward (the node
+// card's own AvailabilityForm); it's now part of enrollment itself so a
+// node is actually bookable the moment it's created, not silently inert
+// until someone notices.
+
+test('enrolling a node also sets its availability window with the SAME node_id enrollNode returned', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithNoNodes())
+  api.enrollNode.mockResolvedValue({ node_id: 'brand-new-node' })
+  api.addAvailability.mockResolvedValue({})
+  render(<ProviderDashboard />)
+  fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
+
+  fireEvent.change(screen.getByPlaceholderText("paste the command's output here"), { target: { value: 'f'.repeat(64) } })
+  fireEvent.change(screen.getByLabelText('GPU model'), { target: { value: 'RTX 3080' } })
+  fireEvent.change(screen.getByLabelText('VRAM (GB)'), { target: { value: '10' } })
+  fireEvent.change(screen.getByLabelText('CPU cores'), { target: { value: '8' } })
+  fireEvent.change(screen.getByLabelText('RAM (GB)'), { target: { value: '16' } })
+  fireEvent.change(screen.getByLabelText('Price (₹/hr)'), { target: { value: '25' } })
+  fireEvent.click(screen.getByRole('button', { name: /enroll this machine/i }))
+
+  await waitFor(() => expect(api.addAvailability).toHaveBeenCalledTimes(1))
+  const [nodeId, start, end] = api.addAvailability.mock.calls[0]
+  expect(nodeId).toBe('brand-new-node')
+  expect(new Date(end).getTime()).toBeGreaterThan(new Date(start).getTime())
+})
+
+test('a sensible default availability window is pre-filled -- not left empty or a plausible fake value', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithNoNodes())
+  render(<ProviderDashboard />)
+  fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
+
+  const availabilityStart = screen.getByLabelText('Start')
+  const now = Date.now()
+  const startMs = new Date(availabilityStart.value).getTime()
+  // Defaults to "starting in about an hour" -- close to now, not some far
+  // future placeholder a provider would have to remember to fix.
+  expect(startMs).toBeGreaterThan(now)
+  expect(startMs).toBeLessThan(now + 2 * 60 * 60 * 1000)
+})
+
+test('enrollment succeeds even if setting availability afterward fails -- the node is not silently lost', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithNoNodes())
+  api.enrollNode.mockResolvedValue({ node_id: 'partial-node' })
+  api.addAvailability.mockRejectedValue(new Error('window_end must be after window_start'))
+  render(<ProviderDashboard />)
+  fireEvent.click(await screen.findByRole('button', { name: /enroll a node/i }))
+
+  fireEvent.change(screen.getByPlaceholderText("paste the command's output here"), { target: { value: 'g'.repeat(64) } })
+  fireEvent.change(screen.getByLabelText('GPU model'), { target: { value: 'RTX 3080' } })
+  fireEvent.change(screen.getByLabelText('VRAM (GB)'), { target: { value: '10' } })
+  fireEvent.change(screen.getByLabelText('CPU cores'), { target: { value: '8' } })
+  fireEvent.change(screen.getByLabelText('RAM (GB)'), { target: { value: '16' } })
+  fireEvent.change(screen.getByLabelText('Price (₹/hr)'), { target: { value: '25' } })
+  fireEvent.click(screen.getByRole('button', { name: /enroll this machine/i }))
+
+  // The real, already-created node is surfaced honestly -- not reported
+  // as if enrollment itself failed -- and the form stays open (rather
+  // than being force-closed, which would destroy this exact message
+  // before anyone could read it).
+  expect(await screen.findByText(/node enrolled, but setting its availability failed/i)).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /enroll this machine/i })).toBeInTheDocument()
+})
+
 // Regression coverage for the follow-up gap: pasting a bare hex string
 // used to be the ONLY thing this field accepted, leaving GPU
 // model/VRAM/cores/RAM to be typed in by hand and guessed. The CLI

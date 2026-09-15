@@ -385,6 +385,15 @@ function EnrollNodeForm({ onEnrolled }) {
   const [error, setError] = useState(null)
   const [detected, setDetected] = useState(null) // which fields the pasted JSON actually filled in, for the confirmation note below
   const [noGpuDetected, setNoGpuDetected] = useState(false) // real hardware.py output, gpu_model: null -- worth explaining, not a silent blank
+  // Folded into enrollment itself (rather than left as a separate step on
+  // the node card afterward) so a node is actually bookable the moment it
+  // finishes enrolling -- a real gap this project had until now: a node
+  // with zero availability windows never appears in search no matter what
+  // else matches, and enrolling alone never created one. The node card's
+  // own AvailabilityForm still exists too, for adding further windows later.
+  const now = new Date()
+  const [availStart, setAvailStart] = useState(toDatetimeLocalValue(new Date(now.getTime() + 60 * 60 * 1000)))
+  const [availEnd, setAvailEnd] = useState(toDatetimeLocalValue(new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)))
 
   // The CLI snippet below prints a JSON blob (public key + real detected
   // hardware, see worker/nodeva_worker/hardware.py's describe_this_machine)
@@ -420,8 +429,9 @@ function EnrollNodeForm({ onEnrolled }) {
   async function submit(e) {
     e.preventDefault()
     setBusy(true); setError(null)
+    let nodeId
     try {
-      await api.enrollNode({
+      const result = await api.enrollNode({
         public_key_hex: pubKey.trim(),
         gpu_model: gpuModel,
         gpu_vram_mb: Number(vram) * 1024,
@@ -429,12 +439,31 @@ function EnrollNodeForm({ onEnrolled }) {
         ram_mb: Number(ram) * 1024,
         price_paise_hr: Math.round(Number(price) * 100),
       })
-      onEnrolled()
+      nodeId = result.node_id
     } catch (e) {
       setError(e.message)
-    } finally {
       setBusy(false)
+      return
     }
+    try {
+      // A separate try/catch: the node itself is already real at this
+      // point (enrollNode succeeded) -- a failure here (e.g. end before
+      // start) must not be reported as "enrollment failed" when it
+      // actually succeeded. Deliberately does NOT call onEnrolled() here
+      // (that would close this form via the parent's setShowEnroll(false),
+      // destroying this exact error message before anyone could read it)
+      // -- the dashboard's own 5s poll (ProviderDashboard's effect) picks
+      // up the new node on its own shortly either way, and the node
+      // card's own AvailabilityForm is the fallback for fixing this.
+      await api.addAvailability(nodeId, new Date(availStart).toISOString(), new Date(availEnd).toISOString())
+    } catch (e) {
+      setError(`Node enrolled, but setting its availability failed: ${e.message}. ` +
+        'You can add a window from its card once this form is closed.')
+      setBusy(false)
+      return
+    }
+    setBusy(false)
+    onEnrolled()
   }
 
   return (
@@ -489,6 +518,15 @@ print(json.dumps({'public_key_hex': ident.public_key_raw().hex(), **describe_thi
         <LabeledInput label="RAM (GB)" type="number" min="1" value={ram} onChange={setRam} placeholder="e.g. 32" required />
       </div>
       <LabeledInput label="Price (₹/hr)" type="number" min="1" step="0.01" value={price} onChange={setPrice} placeholder="e.g. 43" required />
+      <div>
+        <p className="mb-1 text-xs font-medium text-neutral-600">
+          Available for booking from / until (a node with no window is never bookable, no matter what else matches):
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <LabeledInput label="Start" type="datetime-local" value={availStart} onChange={setAvailStart} required />
+          <LabeledInput label="End" type="datetime-local" value={availEnd} onChange={setAvailEnd} required />
+        </div>
+      </div>
       {error && <div className="text-sm text-red-600">{error}</div>}
       <button disabled={busy}
         className="rounded bg-neutral-800 px-4 py-2 font-medium text-white hover:bg-neutral-900 disabled:opacity-50">
