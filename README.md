@@ -968,5 +968,7 @@ The signature fixtures shared by both suites are regenerated with
 `.venv/bin/python worker/tools/gen_interop_fixture.py`.
 
 See `docs/architecture.md` for a component diagram and the main request
-flows, and `CONTRIBUTING.md` for dev setup and what this project expects
-of a change.
+flows, `CONTRIBUTING.md` for dev setup and what this project expects
+of a change, and `docs/deployment.md` for actually putting this somewhere
+real (a `render.yaml` Blueprint is included) -- including what does and
+does not get centrally deployed (the worker deliberately doesn't).
