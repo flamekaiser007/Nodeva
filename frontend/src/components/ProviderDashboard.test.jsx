@@ -8,6 +8,7 @@ vi.mock('../api', () => ({
     becomeProvider: vi.fn(),
     enrollNode: vi.fn(),
     retireNode: vi.fn(),
+    addAvailability: vi.fn(),
   },
 }))
 import { api } from '../api'
@@ -289,4 +290,43 @@ test('an offline node with a STALE heartbeat from before it disconnected still s
   expect(await screen.findByText('RTX 4090')).toBeInTheDocument()
   expect(screen.getByText(/run_worker\.py/)).toBeInTheDocument()
   expect(screen.queryByText(/CPU-only node/)).not.toBeInTheDocument()
+})
+
+// --- availability window form -------------------------------------------
+// Regression coverage for a real, significant gap: api.addAvailability
+// existed in api.js but nothing in the UI ever called it. A node with zero
+// node_availability rows can never appear in search results
+// (searchCandidates joins against it), no matter how well it otherwise
+// matches -- there was simply no way for a provider to make a node
+// bookable through the app at all.
+
+test('every node card shows an availability form, and submitting it calls addAvailability', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithOneNode())
+  api.addAvailability.mockResolvedValue({})
+  render(<ProviderDashboard />)
+
+  expect(await screen.findByText('RTX 4090')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: /add window/i }))
+
+  await waitFor(() => expect(api.addAvailability).toHaveBeenCalledTimes(1))
+  const [nodeId, start, end] = api.addAvailability.mock.calls[0]
+  assert_iso(start); assert_iso(end)
+  expect(nodeId).toBe('node-1')
+  expect(await screen.findByText(/added -- bookable from/i)).toBeInTheDocument()
+})
+
+function assert_iso(value) {
+  expect(() => new Date(value).toISOString()).not.toThrow()
+  expect(value).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/)
+}
+
+test('a failed addAvailability call shows the real error, not a silent failure', async () => {
+  api.providerDashboard.mockResolvedValue(dashboardWithOneNode())
+  api.addAvailability.mockRejectedValue(new Error('window_end must be after window_start'))
+  render(<ProviderDashboard />)
+
+  expect(await screen.findByText('RTX 4090')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: /add window/i }))
+
+  expect(await screen.findByText(/window_end must be after window_start/i)).toBeInTheDocument()
 })

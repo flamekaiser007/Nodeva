@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import { toDatetimeLocalValue } from '../lib/datetime'
 
 function paise(p) { return `₹${(p / 100).toFixed(2)}` }
 
@@ -267,7 +268,70 @@ function NodeCard({ node, onRetired }) {
         </div>
       )}
       {node.hardware_mismatch && <HardwareMismatchNotice mismatches={node.hardware_mismatch} />}
+      <AvailabilityForm nodeId={node.node_id} />
     </div>
+  )
+}
+
+// A real, significant gap this closes: api.addAvailability existed in
+// api.js but was never called from anywhere in the UI -- there was no way
+// for a provider to actually make a node bookable. A node with zero
+// node_availability rows NEVER appears in search results (searchCandidates,
+// backend/src/marketplace/nodeStore.js), regardless of being online,
+// matching every other filter, or being priced attractively; every node
+// that ever worked in this project before now had its availability set
+// via a manual curl call, not through the app.
+function AvailabilityForm({ nodeId }) {
+  const now = new Date()
+  const in1h = new Date(now.getTime() + 60 * 60 * 1000)
+  const in1w = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000)
+  const [start, setStart] = useState(toDatetimeLocalValue(in1h))
+  const [end, setEnd] = useState(toDatetimeLocalValue(in1w))
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const [added, setAdded] = useState(null)
+
+  async function submit(e) {
+    e.preventDefault()
+    setBusy(true); setError(null); setAdded(null)
+    try {
+      // new Date(datetimeLocalValue) parses as LOCAL time, matching
+      // toDatetimeLocalValue's own local getters -- the same round trip
+      // SearchForm.jsx uses, deliberately kept in sync via the shared
+      // ../lib/datetime helper rather than reimplemented here.
+      await api.addAvailability(nodeId, new Date(start).toISOString(), new Date(end).toISOString())
+      setAdded({ start, end })
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="mt-2 rounded border border-neutral-200 p-2 text-xs">
+      <p className="mb-1.5 font-medium text-neutral-600">
+        Add an availability window (a node with none is never bookable, no matter what else matches):
+      </p>
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="flex flex-col gap-0.5">
+          <span className="text-neutral-500">Start</span>
+          <input type="datetime-local" value={start} onChange={(e) => setStart(e.target.value)}
+            className="rounded border border-neutral-300 px-1.5 py-1" />
+        </label>
+        <label className="flex flex-col gap-0.5">
+          <span className="text-neutral-500">End</span>
+          <input type="datetime-local" value={end} onChange={(e) => setEnd(e.target.value)}
+            className="rounded border border-neutral-300 px-1.5 py-1" />
+        </label>
+        <button disabled={busy}
+          className="rounded bg-neutral-800 px-3 py-1.5 font-medium text-white hover:bg-neutral-900 disabled:opacity-50">
+          {busy ? 'Adding…' : '+ Add window'}
+        </button>
+      </div>
+      {error && <p className="mt-1 text-red-600">{error}</p>}
+      {added && <p className="mt-1 text-emerald-700">✓ Added -- bookable from {added.start} to {added.end} (local time).</p>}
+    </form>
   )
 }
 
