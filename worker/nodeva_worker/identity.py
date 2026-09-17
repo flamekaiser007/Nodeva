@@ -27,7 +27,7 @@ class NodeIdentity:
         self._sk = private_key
 
     @classmethod
-    def load_or_create(cls, path: Path) -> "NodeIdentity":
+    def load_or_create(cls, path: Path, _os_name=None) -> "NodeIdentity":
         # `.expanduser()` is required here -- pathlib does NOT expand a
         # leading `~` on its own (`Path('~/x')` is a literal path segment
         # named `~` under the current working directory, not $HOME). A
@@ -44,13 +44,18 @@ class NodeIdentity:
         if path.exists():
             # Refuse to use a key other users on the box can read. On a shared
             # workstation this is the difference between a node identity and a
-            # stolen one.
-            mode = stat.S_IMODE(path.stat().st_mode)
-            if mode & 0o077:
-                raise PermissionError(
-                    f"{path} is mode {mode:o}; private key must not be "
-                    f"group/world readable (chmod 600)"
-                )
+            # stolen one. POSIX-only: Windows has no user/group/other bits --
+            # NTFS/os.stat() reports the same read-only-or-not pattern for all
+            # three, which would trip this check on every single run and
+            # permanently block a Windows provider from ever starting their
+            # worker after the key's first creation.
+            if (_os_name or os.name) == "posix":
+                mode = stat.S_IMODE(path.stat().st_mode)
+                if mode & 0o077:
+                    raise PermissionError(
+                        f"{path} is mode {mode:o}; private key must not be "
+                        f"group/world readable (chmod 600)"
+                    )
             sk = serialization.load_pem_private_key(path.read_bytes(), password=None)
             if not isinstance(sk, Ed25519PrivateKey):
                 raise TypeError(f"{path} is not an Ed25519 private key")
