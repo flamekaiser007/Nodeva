@@ -30,11 +30,24 @@ function keypair() {
 }
 
 const tick = () => new Promise((r) => setImmediate(r));
-// A real timer, not more microtask ticks -- lookupPublicKey does a real
-// Postgres round trip (async I/O), which setImmediate alone does not
-// reliably wait out (same lesson verification-flow.test.js's identical
-// comment documents).
-const settle = () => new Promise((r) => setTimeout(r, 50));
+// Wait for the message we actually need rather than for a fixed duration.
+// These steps wait out a real Postgres round trip (async I/O, which
+// setImmediate alone does not reliably cover -- the lesson
+// verification-flow.test.js's identical comment documents), and a plain
+// `setTimeout(50)` silently becomes a race the moment Postgres is slower
+// than that: `node --test` runs test files in PARALLEL against one shared
+// database, so under that contention 50ms was sometimes not enough and
+// lastSent() returned the PREVIOUS message, producing a wrong
+// reservation_id and a bogus failure. Caught live as a rare CI flake.
+async function waitForSent(sock, type, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const msg = sock.lastSent();
+    if (msg?.type === type) return msg;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  throw new Error(`timed out waiting for ${type}; last was ${sock.lastSent()?.type}`);
+}
 
 const DATABASE_URL = process.env.DATABASE_URL
   ?? 'postgresql://nodeva:nodeva_dev@localhost:5433/nodeva';
@@ -175,8 +188,7 @@ test('a genuinely created reservation (real node, real signed receipt) increment
     const sock = new FakeSocket();
     hub.handleConnection(sock);
     sock.receive({ type: TYPE.HELLO, node_id });
-    await settle(); // lookupPublicKey is a real Postgres query
-    const challenge = sock.lastSent();
+    const challenge = await waitForSent(sock, TYPE.CHALLENGE);
     const sig = kp.sign(Buffer.from(challenge.nonce, 'utf8'));
     sock.receive({ type: TYPE.CHALLENGE_RESPONSE, signature_hex: sig.toString('hex') });
     await tick();
@@ -187,9 +199,9 @@ test('a genuinely created reservation (real node, real signed receipt) increment
       method: 'POST', headers: { ...authed(buyer.token), 'content-type': 'application/json' },
       body: JSON.stringify({ node_id, starts_at: startsAt, ends_at: endsAt }),
     });
-    await settle(); // POST /reservations does real Postgres work before RESERVE_REQUEST is sent
+    const request = await waitForSent(sock, TYPE.RESERVE_REQUEST);
     const body = {
-      reservation_id: sock.lastSent().reservation_id, node_id,
+      reservation_id: request.reservation_id, node_id,
       starts_at: startsAt, ends_at: endsAt, price_paise_hr: 4300,
       hold_expires_at: Date.now() + 120_000, issued_at: Date.now(),
     };

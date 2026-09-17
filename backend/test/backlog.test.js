@@ -78,8 +78,7 @@ test('a pending refund retry increments the pending gauge by exactly one', { ski
   assert.equal(after - before, 1);
 });
 
-test('a refund retry that hits the ceiling moves from pending to exhausted, net zero on pending', { skip }, async () => {
-  const beforePending = await gaugeValue('nodeva_refund_retries_pending', '\\{status="pending"\\}');
+test('a refund retry that hits the ceiling moves from pending to exhausted', { skip }, async () => {
   const beforeExhausted = await gaugeValue('nodeva_refund_retries_pending', '\\{status="exhausted"\\}');
 
   const paymentId = await seedPayment();
@@ -96,10 +95,27 @@ test('a refund retry that hits the ceiling moves from pending to exhausted, net 
     await processRefundRetries(pool, gateway);
   }
 
-  const afterPending = await gaugeValue('nodeva_refund_retries_pending', '\\{status="pending"\\}');
+  // A global `pending` delta is NOT a property this test can truthfully
+  // assert. processRefundRetries() is global by design -- it picks up every
+  // due pending row in the table, not just this payment's -- so driving it
+  // 12 times with an always-failing gateway necessarily exhausts whatever
+  // OTHER suites happen to have pending at that moment. `node --test` runs
+  // test files in parallel against one shared Postgres, so that collateral
+  // is real and racy: caught live in CI as `-9 !== 0` when nine of
+  // refunds.test.js's rows went over the ceiling alongside this one.
+  //
+  // What IS true, and is the actual behaviour under test, is scoped to this
+  // test's own row.
+  const { rows: [own] } = await pool.query(
+    'SELECT status, attempts FROM refund_retries WHERE payment_id = $1', [paymentId]);
+  assert.equal(own.status, 'exhausted', 'this test\'s retry must have left pending for exhausted');
+  assert.ok(own.attempts >= 10, `must have hit the ceiling, got ${own.attempts} attempts`);
+
+  // And the gauge reflects it. Only a lower bound, for the same reason:
+  // collateral rows land in exhausted too (an always-failing gateway never
+  // produces 'succeeded'), so the series can legitimately rise by more.
   const afterExhausted = await gaugeValue('nodeva_refund_retries_pending', '\\{status="exhausted"\\}');
-  assert.equal(afterPending - beforePending, 0, 'the one retry this test created must have LEFT pending');
-  assert.equal(afterExhausted - beforeExhausted, 1, 'and landed in exhausted, exactly once');
+  assert.ok(afterExhausted - beforeExhausted >= 1, 'the exhausted series must reflect it');
 });
 
 test('all three refund-retry statuses are always present in the scrape, even at zero', { skip }, async () => {
