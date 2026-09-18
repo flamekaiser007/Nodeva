@@ -57,6 +57,39 @@ async function paymentStatus(paymentId) {
   return rows[0].status;
 }
 
+/**
+ * Sweep until THIS payment's retry row is actually visited, and return what
+ * changed when it was.
+ *
+ * A single processRefundRetries() call is not a reliable way to reach one
+ * specific row: the sweep scans the whole table `ORDER BY next_attempt_at
+ * LIMIT 20` (correct for a real deployment, where many rows come due at
+ * once). `node --test` runs test files in PARALLEL against one shared
+ * Postgres, and backlog.test.js forces batches of rows due at the same
+ * instant, so this row can sit outside that top 20 and simply never be
+ * visited -- the sweep then "succeeds" having done nothing here, and an
+ * assertion about this row fails for reasons that have nothing to do with
+ * the behaviour under test. Caught live as a rare CI/local flake.
+ *
+ * Returns as soon as the row is touched, so a caller asserting "attempts
+ * incremented by exactly one" still sees exactly one increment.
+ */
+async function sweepUntilTouched(gateway, paymentId, maxPasses = 25) {
+  const before = await retryRow(paymentId);
+  for (let pass = 0; pass < maxPasses; pass++) {
+    await processRefundRetries(pool, gateway);
+    const after = await retryRow(paymentId);
+    if (after.status !== before.status || after.attempts !== before.attempts) {
+      return { before, after };
+    }
+    // Still not reached. Keep this row due; rows that DID get processed have
+    // had their own backoff pushed out, so contention drops each pass.
+    await pool.query(
+      "UPDATE refund_retries SET next_attempt_at = now() WHERE payment_id=$1", [paymentId]);
+  }
+  throw new Error(`refund retry for ${paymentId} was never swept in ${maxPasses} passes`);
+}
+
 test('a refund that succeeds immediately marks the payment refunded and queues nothing', { skip }, async () => {
   const { paymentId } = await seedPayment();
   const gateway = new ScriptedGateway();
@@ -110,18 +143,12 @@ test('a due retry that now succeeds marks the payment refunded and the retry suc
   // Force the row due now rather than waiting out the real backoff delay.
   await pool.query("UPDATE refund_retries SET next_attempt_at = now() WHERE payment_id=$1", [paymentId]);
 
-  const result = await processRefundRetries(pool, gateway);
-  // NOT asserting an exact result.processed count: this sweep scans the
-  // WHOLE table (by design -- a real deployment has many rows due at once),
-  // and this test file shares one persistent dev Postgres across repeated
-  // runs, so a leftover 'pending' row from an earlier invocation of this
-  // same suite can legitimately also be due and counted. What actually
-  // matters -- THIS payment's own outcome -- is asserted below regardless
-  // of how many other rows the sweep happened to touch.
-  assert.ok(result.processed >= 1);
+  // Not asserting an exact processed count, and not assuming one sweep
+  // reaches this row -- see sweepUntilTouched. What matters is THIS
+  // payment's own outcome, however much other traffic the sweep saw.
+  const { after } = await sweepUntilTouched(gateway, paymentId);
   assert.equal(await paymentStatus(paymentId), 'refunded');
-  const row = await retryRow(paymentId);
-  assert.equal(row.status, 'succeeded');
+  assert.equal(after.status, 'succeeded');
 });
 
 test('a retry that fails again stays pending with incremented attempts and a later next_attempt_at', { skip }, async () => {
@@ -131,9 +158,7 @@ test('a retry that fails again stays pending with incremented attempts and a lat
   await issueRefund(pool, gateway, { paymentId, reservationId: null, gatewayRef: 'pay_retry_2', amountPaise: 4300 });
   await pool.query("UPDATE refund_retries SET next_attempt_at = now() WHERE payment_id=$1", [paymentId]);
 
-  const before = await retryRow(paymentId);
-  await processRefundRetries(pool, gateway);
-  const after = await retryRow(paymentId);
+  const { before, after } = await sweepUntilTouched(gateway, paymentId);
 
   assert.equal(after.status, 'pending');
   assert.equal(after.attempts, before.attempts + 1);

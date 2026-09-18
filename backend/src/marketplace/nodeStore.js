@@ -5,6 +5,68 @@
 // right now" — the hub's in-memory presence is closer to ground truth than
 // this column is, which is why searchCandidates cross-checks both.
 
+/**
+ * Everything a buyer could actually rent right now, with no requirements to
+ * state up front -- the browse view's counterpart to searchCandidates.
+ *
+ * "Bookable" is deliberately the SAME bar search applies, so the catalogue
+ * can never advertise something search would refuse to return:
+ *   - status='online' (which also excludes 'draining', i.e. retired nodes)
+ *   - the hub agrees the socket is actually up, not just the last heartbeat
+ *   - at least one availability window that has not already ended
+ *
+ * That last one is the difference between this and a raw node dump: a node
+ * with no availability window cannot be booked for any time at all, so
+ * listing it would be advertising something nobody can buy.
+ */
+export async function browseCatalogue(pool, hub, { now = new Date() } = {}) {
+  const { rows } = await pool.query(
+    `SELECT n.node_id, n.gpu_model, n.gpu_vram_mb, n.cpu_cores, n.ram_mb,
+            n.price_paise_hr, n.perf_score, n.status,
+            p.rep_jobs_total, p.rep_jobs_failed
+       FROM compute_nodes n
+       JOIN providers p ON p.provider_id = n.provider_id
+      WHERE n.status = 'online'`);
+
+  const nodeIds = rows.map((r) => r.node_id);
+  const availability = nodeIds.length
+    ? await pool.query(
+        `SELECT node_id, window_start, window_end FROM node_availability
+          WHERE node_id = ANY($1::uuid[]) AND window_end >= $2
+          ORDER BY window_start`,
+        [nodeIds, now],
+      )
+    : { rows: [] };
+
+  const windowsByNode = new Map();
+  for (const a of availability.rows) {
+    const list = windowsByNode.get(a.node_id) ?? [];
+    list.push({ start: a.window_start.getTime(), end: a.window_end.getTime() });
+    windowsByNode.set(a.node_id, list);
+  }
+
+  return rows
+    .filter((r) => hub.isOnline(r.node_id))
+    .filter((r) => windowsByNode.has(r.node_id))
+    .map((r) => ({
+      id: r.node_id,
+      gpu_model: r.gpu_model,
+      gpu_vram_mb: r.gpu_vram_mb,
+      cpu_cores: r.cpu_cores,
+      ram_mb: r.ram_mb,
+      price_paise_hr: r.price_paise_hr,
+      perf_score: r.perf_score,
+      // Same neutral prior as searchCandidates -- a brand-new provider must
+      // not read as either proven or terrible. See its comment for why.
+      reliability: r.rep_jobs_total > 0
+        ? 1 - r.rep_jobs_failed / r.rep_jobs_total
+        : 0.8,
+      rep_jobs_total: r.rep_jobs_total,
+      availability: windowsByNode.get(r.node_id),
+    }))
+    .sort((a, b) => a.price_paise_hr - b.price_paise_hr);
+}
+
 export async function searchCandidates(pool, hub, req) {
   // Broad SQL prefilter (index-friendly columns), fine-grained window and
   // scoring logic stays in scheduler.js so it is shared with tests that don't

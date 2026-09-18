@@ -3,6 +3,7 @@ import { api, ApiError, setToken } from './api'
 import UserBar from './components/UserBar'
 import SearchForm from './components/SearchForm'
 import ResultsList from './components/ResultsList'
+import BrowseNodes from './components/BrowseNodes'
 import ActiveReservation from './components/ActiveReservation'
 import VerifiedPairReservation from './components/VerifiedPairReservation'
 import ProviderDashboard from './components/ProviderDashboard'
@@ -86,10 +87,18 @@ export default function App() {
   }
 
   async function handleReserve(candidate) {
+    return reserveWindow(candidate.node.id, lastQuery.starts_at, lastQuery.ends_at)
+  }
+
+  // Shared by the search results (which book the window the user searched
+  // for) and the browse catalogue (which books one of the node's own
+  // advertised availability windows) -- the session/401/409 handling below
+  // is identical for both and worth having in exactly one place.
+  async function reserveWindow(nodeId, startsAt, endsAt) {
     if (!session) { setError('sign in first'); return }
-    setReservingId(candidate.node.id); setError(null)
+    setReservingId(nodeId); setError(null)
     try {
-      const r = await api.reserve(candidate.node.id, lastQuery.starts_at, lastQuery.ends_at)
+      const r = await api.reserve(nodeId, startsAt, endsAt)
       setReservation(r)
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
@@ -175,6 +184,7 @@ export default function App() {
       {session && (
         <div className="mx-auto flex max-w-3xl gap-2 px-4 pt-4">
           <ModeTab active={mode === 'rent'} onClick={() => setMode('rent')}>Rent GPU</ModeTab>
+          <ModeTab active={mode === 'browse'} onClick={() => setMode('browse')}>Browse</ModeTab>
           <ModeTab active={mode === 'share'} onClick={() => setMode('share')}>Share GPU</ModeTab>
         </div>
       )}
@@ -194,7 +204,15 @@ export default function App() {
         ) : reservation ? (
           <ActiveReservation
             reservation={reservation}
-            onSettled={() => { setReservation(null); handleSearch(lastQuery) }}
+            // Only re-run a search if there WAS one: a booking made from the
+            // browse tab has no query to refresh, and search(null) would
+            // just throw.
+            onSettled={() => { setReservation(null); if (lastQuery) handleSearch(lastQuery) }}
+          />
+        ) : mode === 'browse' ? (
+          <BrowseNodes
+            onReserve={(node, window) => reserveWindow(node.id, window.start, window.end)}
+            reservingId={reservingId}
           />
         ) : (
           <>

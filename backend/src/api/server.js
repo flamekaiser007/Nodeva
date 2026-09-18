@@ -12,7 +12,7 @@ import crypto from 'node:crypto';
 import { Hub, NodeOffline, NodeRefused, NodeTimeout } from '../ws/hub.js';
 import { attachClusterRelay } from '../ws/clusterRelay.js';
 import { admitReceipt } from '../lib/verify.js';
-import { searchCandidates } from '../marketplace/nodeStore.js';
+import { searchCandidates, browseCatalogue } from '../marketplace/nodeStore.js';
 import { rank } from '../marketplace/scheduler.js';
 import { quote, split, meteredCharge } from '../payments/settle.js';
 import { S, canTransition, SETTLEMENT } from '../reservations/machine.js';
@@ -644,15 +644,20 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
     } catch (e) { next(e); }
   });
 
+  // The browse catalogue: what a buyer could rent right now WITHOUT having
+  // to state requirements first, which /search demands.
+  //
+  // This used to be a raw dump of every row in compute_nodes, ordered by
+  // newest. Nothing consumed it (api.js exported a listNodes() no component
+  // ever called), and the shape was wrong for anything that might: it
+  // included 'draining' nodes the provider had already retired, reported a
+  // `status` column the hub can contradict, and carried no availability at
+  // all -- so a caller could not tell which listings were actually bookable.
+  // browseCatalogue applies exactly the bar /search applies; see its own
+  // comment.
   app.get('/nodes', async (req, res, next) => {
     try {
-      const { rows } = await pool.query(
-        `SELECT n.node_id, n.gpu_model, n.gpu_vram_mb, n.cpu_cores, n.ram_mb,
-                n.price_paise_hr, n.status, n.last_seen_at, n.created_at,
-                p.rep_jobs_total, p.rep_jobs_failed
-           FROM compute_nodes n JOIN providers p ON p.provider_id = n.provider_id
-          ORDER BY n.created_at DESC`);
-      res.json({ nodes: rows });
+      res.json({ nodes: await browseCatalogue(pool, hub) });
     } catch (e) { next(e); }
   });
 
