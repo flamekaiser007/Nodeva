@@ -37,12 +37,21 @@ def _resource_limits(msg: dict) -> dict:
     ran at JobSpec's 2048MB/2.0-core defaults no matter what was advertised
     or paid for, which made those listing fields decorative.
 
-    Clamped to what this machine can actually spare (offerable_memory_mb),
-    because the advertised figure is TOTAL physical RAM: honouring it
-    literally would leave nothing for the provider's OS, the Docker daemon,
-    or this worker process. A clamp is logged rather than hidden -- it means
-    this node is advertising more than it can really deliver, which is the
-    provider's own listing to correct.
+    Both are clamped to what this machine can actually deliver, and for two
+    different reasons:
+
+    - RAM, because the advertised figure is TOTAL physical memory: honouring
+      it literally would leave nothing for the provider's OS, the Docker
+      daemon, or this worker process.
+    - CPUs, because `docker run --cpus` above the host's core count is a
+      hard ERROR ("Range of CPUs is from 0.01 to N.00"), not a best-effort
+      request. Unclamped, a node advertising more cores than it has could
+      not run ANY job -- every container would fail to start. Caught by the
+      e2e suite, whose node claims 16 cores on a 4-core CI runner.
+
+    A clamp is logged rather than hidden -- it means this node advertises
+    more than it can really deliver, which is the provider's listing to
+    correct.
 
     Falls back to JobSpec's defaults when the platform sends nothing, so a
     worker stays compatible with a backend that predates this field.
@@ -64,7 +73,15 @@ def _resource_limits(msg: dict) -> dict:
 
     requested_cpus = msg.get("cpus")
     if requested_cpus:
-        limits["cpus"] = float(requested_cpus)
+        requested_cpus = float(requested_cpus)
+        actual_cores = detect_cpu_cores()
+        if actual_cores and requested_cpus > actual_cores:
+            log.warning(
+                "job asked for %s CPUs but this machine has only %d -- capping. "
+                "This node's advertised cpu_cores is too high.",
+                requested_cpus, actual_cores)
+            requested_cpus = float(actual_cores)
+        limits["cpus"] = requested_cpus
 
     return limits
 

@@ -254,9 +254,38 @@ def test_the_reserved_specs_are_what_the_container_actually_gets(monkeypatch):
     # A node genuinely big enough to honour what it advertised.
     import nodeva_worker.link as link_module
     monkeypatch.setattr(link_module, "detect_ram_mb", lambda: 65536)
+    monkeypatch.setattr(link_module, "detect_cpu_cores", lambda: 32)
 
     limits = _resource_limits({"memory_mb": 32768, "cpus": 16})
     assert limits == {"memory_mb": 32768, "cpus": 16.0}
+
+
+def test_more_cpus_than_the_machine_has_is_capped(monkeypatch, caplog):
+    # NOT a cosmetic cap: `docker run --cpus` above the host's core count is
+    # a hard error, so leaving this unclamped means the node can run no jobs
+    # at all. The e2e suite's node claims 16 cores on a 4-core CI runner.
+    import nodeva_worker.link as link_module
+    monkeypatch.setattr(link_module, "detect_cpu_cores", lambda: 4)
+
+    with caplog.at_level(logging.WARNING):
+        limits = _resource_limits({"cpus": 16})
+
+    assert limits["cpus"] == 4.0
+    assert "advertised cpu_cores is too high" in caplog.text
+
+
+def test_cpus_within_the_machine_s_core_count_are_left_alone(monkeypatch):
+    import nodeva_worker.link as link_module
+    monkeypatch.setattr(link_module, "detect_cpu_cores", lambda: 16)
+    assert _resource_limits({"cpus": 8})["cpus"] == 8.0
+
+
+def test_an_undetectable_core_count_does_not_block_the_job(monkeypatch):
+    # os.cpu_count() can genuinely return None -- honour the request rather
+    # than refusing to run, same posture as the RAM path.
+    import nodeva_worker.link as link_module
+    monkeypatch.setattr(link_module, "detect_cpu_cores", lambda: None)
+    assert _resource_limits({"cpus": 8})["cpus"] == 8.0
 
 
 def test_a_platform_that_sends_no_limits_falls_back_to_jobspec_defaults():
@@ -303,6 +332,7 @@ def test_the_limits_actually_reach_the_container_spec(link, monkeypatch):
     # _run_and_report builds and hands to run_job.
     import nodeva_worker.link as link_module
     monkeypatch.setattr(link_module, "detect_ram_mb", lambda: 65536)
+    monkeypatch.setattr(link_module, "detect_cpu_cores", lambda: 32)
 
     captured = {}
 
