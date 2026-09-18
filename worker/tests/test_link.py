@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 import websockets
-from nodeva_worker.link import WorkerLink, _resource_limits
+from nodeva_worker.link import WorkerLink, _resource_limits, NodeRejected
 from nodeva_worker.executor import JobResult
 from nodeva_worker.reservations import ReservationStore, HELD, CONFIRMED, RELEASED
 
@@ -369,3 +369,43 @@ def test_a_job_with_no_limits_still_reaches_the_container_at_jobspec_defaults(li
 
     assert captured["spec"].memory_mb == 2048
     assert captured["spec"].cpus == 2.0
+
+
+# --- handshake rejection ------------------------------------------------
+# A node_id the backend doesn't know used to surface as
+# `RuntimeError: expected CHALLENGE, got REJECT` plus a full traceback,
+# which says nothing about the actual cause. The common real case: the node
+# was enrolled against a DEPLOYED backend while the worker still points at
+# the local default --url, so the two are looking at different databases.
+
+class RejectingWs:
+    def __init__(self, reason="unknown node_id"):
+        self.reason = reason
+        self.sent = []
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+    async def recv(self):
+        return json.dumps({"type": "REJECT", "reason": self.reason})
+
+
+def test_a_rejected_handshake_names_the_url_the_node_and_what_to_check(link):
+    ws = RejectingWs()
+    with pytest.raises(NodeRejected) as excinfo:
+        run(link._authenticate(ws))
+
+    message = str(excinfo.value)
+    assert link.url in message, "must name the backend actually being talked to"
+    assert link.node_id in message, "must name the node that was refused"
+    assert "unknown node_id" in message, "must pass through the server's own reason"
+    assert "--url" in message, "must point at the setting that is usually wrong"
+
+
+def test_a_rejection_without_a_reason_still_produces_a_usable_message(link):
+    class NoReasonWs(RejectingWs):
+        async def recv(self):
+            return json.dumps({"type": "REJECT"})
+
+    with pytest.raises(NodeRejected, match="REJECT"):
+        run(link._authenticate(NoReasonWs()))

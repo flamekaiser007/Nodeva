@@ -27,11 +27,13 @@ import signal
 import sys
 from pathlib import Path
 
+import websockets
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from nodeva_worker.identity import NodeIdentity
 from nodeva_worker.reservations import ReservationStore
-from nodeva_worker.link import WorkerLink
+from nodeva_worker.link import WorkerLink, NodeRejected
 
 log = logging.getLogger("nodeva.worker.cli")
 
@@ -95,9 +97,25 @@ def main(argv=None):
         loop.run_until_complete(link.run_forever())
     except KeyboardInterrupt:
         link.stop()
+    except NodeRejected as e:
+        # A configuration mistake, not a crash -- a stack trace here buries
+        # the one line that actually says what to change.
+        log.error("%s", e)
+        return 1
+    except websockets.InvalidStatus as e:
+        # The URL isn't a NODEVA worker endpoint at all (a 404 usually means
+        # the host is right but the path isn't `/worker`, or the host simply
+        # isn't this backend). Retrying cannot fix either, so fail loudly.
+        log.error(
+            "%s refused the WebSocket connection (%s). The --url must be the "
+            "backend's own address ending in /worker, e.g. "
+            "wss://your-backend.example.com/worker",
+            args.url, e)
+        return 1
     finally:
         loop.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

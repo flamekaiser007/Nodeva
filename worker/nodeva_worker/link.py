@@ -28,6 +28,18 @@ HEARTBEAT_INTERVAL_S = 15
 RECONNECT_BACKOFF_S = (1, 2, 5, 10, 30)  # capped exponential-ish backoff
 
 
+class NodeRejected(Exception):
+    """The platform refused this node at the handshake, before any signing.
+
+    Almost always a configuration mistake rather than a bug, and the two
+    causes are worth naming explicitly because they look identical from
+    here: the node_id isn't registered on the backend this worker is
+    pointed at (commonly a node enrolled against a DEPLOYED backend while
+    the worker still uses the local default --url, or vice versa), or the
+    node was retired.
+    """
+
+
 def _resource_limits(msg: dict) -> dict:
     """The container's memory/CPU ceiling for one job.
 
@@ -152,7 +164,13 @@ class WorkerLink:
         await ws.send(json.dumps({"type": "HELLO", "node_id": self.node_id}))
         challenge = json.loads(await ws.recv())
         if challenge["type"] != "CHALLENGE":
-            raise RuntimeError(f"expected CHALLENGE, got {challenge['type']}")
+            raise NodeRejected(
+                f"{self.url} does not recognise node {self.node_id} "
+                f"(replied {challenge['type']}"
+                + (f": {challenge['reason']}" if challenge.get("reason") else "")
+                + "). Check --url points at the backend this node was ENROLLED "
+                  "against, and that the node is not retired."
+            )
         # Sign the raw nonce bytes as sent, not a re-encoded copy — the backend
         # verifies against exactly the string it generated.
         sig = self.identity.sign_raw(challenge["nonce"].encode("utf-8"))
