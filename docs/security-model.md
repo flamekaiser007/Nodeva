@@ -26,6 +26,13 @@ implements the controls below — each one verified against a real container in
 | Process count cap | `--pids-limit` | A fork bomb |
 | Wall-clock timeout | `docker kill` after the reservation window elapses | A runaway or intentionally-infinite job holding the GPU past what was paid for |
 
+The `--memory` and `--cpus` numbers are the reserved node's own advertised
+`ram_mb`/`cpu_cores` -- the figures `/search` filtered on and the booking was
+priced from -- passed through `JOB_SUBMIT` and clamped by the worker to what
+the machine can actually spare (`link.py`'s `_resource_limits`, which leaves
+the provider's own OS the same headroom `offerable_vram_mb` leaves the
+display). They were a hardcoded 2048MB/2 cores until that was wired up.
+
 **What this table does NOT claim:** Docker containers share the host kernel.
 A kernel or NVIDIA driver vulnerability can still escape a correctly-configured
 container — this is a mitigation of blast radius, not a formal isolation

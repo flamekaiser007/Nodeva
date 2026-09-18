@@ -241,3 +241,50 @@ test('releaseReservation rejects fast for an offline node', async () => {
   const hub = new Hub({ lookupPublicKey: async () => null });
   await assert.rejects(hub.releaseReservation('nobody', 'r1'), NodeOffline);
 });
+
+// --- job resource limits -------------------------------------------------
+// The reserved node's advertised ram_mb/cpu_cores have to actually reach the
+// worker, or they are decorative: /search filters on them and the booking is
+// priced from them, but before these were wired through, submitJob sent no
+// limits at all and every job ran at the worker's JobSpec defaults of 2048MB
+// and 2 cores -- a buyer renting a 128GB/32-core machine got 2GB/2 cores.
+
+test('submitJob sends the reserved node\'s advertised memory and cpu limits', async () => {
+  const kp = keypair();
+  const hub = new Hub({ lookupPublicKey: async () => kp.raw });
+  const sock = await authed(hub, 'n1', kp);
+
+  const p = hub.submitJob('n1', {
+    jobId: 'j1', reservationId: 'r1', image: 'alpine:3.20', command: ['true'],
+    memoryMb: 32768, cpus: 16,
+  });
+
+  const pushed = sock.lastSent();
+  assert.equal(pushed.type, TYPE.JOB_SUBMIT);
+  assert.equal(pushed.memory_mb, 32768);
+  assert.equal(pushed.cpus, 16);
+
+  sock.receive({ type: TYPE.JOB_ACCEPTED, job_id: 'j1' });
+  await p;
+});
+
+test('submitJob omits the limits entirely when the node specs are unknown', async () => {
+  // Omitted rather than sent as null: the worker treats an absent field as
+  // "fall back to JobSpec's defaults", which is exactly the pre-existing
+  // behaviour a node with no recorded specs should keep getting.
+  const kp = keypair();
+  const hub = new Hub({ lookupPublicKey: async () => kp.raw });
+  const sock = await authed(hub, 'n1', kp);
+
+  const p = hub.submitJob('n1', {
+    jobId: 'j1', reservationId: 'r1', image: 'alpine:3.20', command: ['true'],
+    memoryMb: null, cpus: null,
+  });
+
+  const pushed = sock.lastSent();
+  assert.ok(!('memory_mb' in pushed), 'must not send a null memory_mb');
+  assert.ok(!('cpus' in pushed), 'must not send a null cpus');
+
+  sock.receive({ type: TYPE.JOB_ACCEPTED, job_id: 'j1' });
+  await p;
+});

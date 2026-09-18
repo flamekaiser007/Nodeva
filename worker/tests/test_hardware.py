@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 import nodeva_worker.hardware as hardware_module
 from nodeva_worker.hardware import (
-    detect_gpus, offerable_vram_mb, NoGpu, _parse_int, GpuInfo,
+    detect_gpus, offerable_vram_mb, offerable_memory_mb, NoGpu, _parse_int, GpuInfo,
     detect_cpu_cores, detect_ram_mb, describe_this_machine,
 )
 
@@ -67,6 +67,18 @@ def test_offerable_vram_excludes_in_use_memory_and_headroom():
 def test_offerable_vram_never_goes_negative():
     g = GpuInfo("x", 4096, 4000, 90, 70, 100, "1")
     assert offerable_vram_mb(g) == 0
+
+
+def test_offerable_memory_leaves_headroom_for_the_provider_s_own_system():
+    # Same reasoning as VRAM above, for system RAM: the OS, the Docker
+    # daemon and the worker process all live in that total.
+    assert offerable_memory_mb(32768) == 31744
+
+
+def test_offerable_memory_never_goes_negative():
+    # A machine smaller than the headroom itself offers nothing, rather
+    # than a negative limit Docker would reject.
+    assert offerable_memory_mb(512) == 0
 
 
 # --- detect_cpu_cores / detect_ram_mb ---------------------------------------

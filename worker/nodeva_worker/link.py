@@ -15,7 +15,10 @@ import websockets
 
 from .canonical import encode
 from .executor import JobSpec, run_job, DockerUnavailable
-from .hardware import detect_gpus, offerable_vram_mb, detect_cpu_cores, detect_ram_mb, NoGpu
+from .hardware import (
+    detect_gpus, offerable_vram_mb, offerable_memory_mb, detect_cpu_cores,
+    detect_ram_mb, NoGpu,
+)
 from .reservations import ReservationStore, SlotUnavailable, CONFIRMED, RUNNING
 from .peer import PeerServer, PeerDirectory
 
@@ -23,6 +26,47 @@ log = logging.getLogger("nodeva.worker.link")
 
 HEARTBEAT_INTERVAL_S = 15
 RECONNECT_BACKOFF_S = (1, 2, 5, 10, 30)  # capped exponential-ish backoff
+
+
+def _resource_limits(msg: dict) -> dict:
+    """The container's memory/CPU ceiling for one job.
+
+    The platform sends what the buyer actually reserved -- this node's own
+    advertised ram_mb/cpu_cores, the numbers search filtered on and the
+    booking was priced from. Before this existed, every job on every node
+    ran at JobSpec's 2048MB/2.0-core defaults no matter what was advertised
+    or paid for, which made those listing fields decorative.
+
+    Clamped to what this machine can actually spare (offerable_memory_mb),
+    because the advertised figure is TOTAL physical RAM: honouring it
+    literally would leave nothing for the provider's OS, the Docker daemon,
+    or this worker process. A clamp is logged rather than hidden -- it means
+    this node is advertising more than it can really deliver, which is the
+    provider's own listing to correct.
+
+    Falls back to JobSpec's defaults when the platform sends nothing, so a
+    worker stays compatible with a backend that predates this field.
+    """
+    limits = {}
+
+    requested_mb = msg.get("memory_mb")
+    if requested_mb:
+        total_mb = detect_ram_mb()
+        safe_mb = offerable_memory_mb(total_mb) if total_mb else None
+        if safe_mb and requested_mb > safe_mb:
+            log.warning(
+                "job asked for %dMB but this machine can only spare %dMB of its "
+                "%dMB total -- capping. This node's advertised ram_mb is too high.",
+                requested_mb, safe_mb, total_mb)
+            requested_mb = safe_mb
+        if requested_mb > 0:
+            limits["memory_mb"] = requested_mb
+
+    requested_cpus = msg.get("cpus")
+    if requested_cpus:
+        limits["cpus"] = float(requested_cpus)
+
+    return limits
 
 
 class WorkerLink:
@@ -271,6 +315,7 @@ class WorkerLink:
             timeout_seconds=msg.get("timeout_seconds", 3600),
             env=msg.get("env") or {},
             gpu_device_ids=msg.get("gpu") or [],
+            **_resource_limits(msg),
         )
         try:
             result = await asyncio.to_thread(run_job, spec)

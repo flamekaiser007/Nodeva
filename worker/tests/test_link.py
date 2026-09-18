@@ -11,6 +11,7 @@ scripts/e2e_demo.sh.
 """
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -18,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 import websockets
-from nodeva_worker.link import WorkerLink
+from nodeva_worker.link import WorkerLink, _resource_limits
+from nodeva_worker.executor import JobResult
 from nodeva_worker.reservations import ReservationStore, HELD, CONFIRMED, RELEASED
 
 T0 = 1_800_000_000_000
@@ -240,3 +242,100 @@ def test_heartbeat_loop_sends_normally_until_the_connection_closes(link, monkeyp
     run(link._heartbeat_loop(ws))
     assert len(ws.sent) == 3
     assert all(msg["type"] == "HEARTBEAT" for msg in ws.sent)
+
+
+# --- job resource limits ------------------------------------------------
+# Before these were wired through, _run_and_report built its JobSpec without
+# memory_mb/cpus at all, so EVERY job on EVERY node silently ran at
+# JobSpec's 2048MB/2.0-core defaults -- regardless of the ram_mb/cpu_cores
+# the provider advertised, /search filtered on, and the buyer paid for.
+
+def test_the_reserved_specs_are_what_the_container_actually_gets(monkeypatch):
+    # A node genuinely big enough to honour what it advertised.
+    import nodeva_worker.link as link_module
+    monkeypatch.setattr(link_module, "detect_ram_mb", lambda: 65536)
+
+    limits = _resource_limits({"memory_mb": 32768, "cpus": 16})
+    assert limits == {"memory_mb": 32768, "cpus": 16.0}
+
+
+def test_a_platform_that_sends_no_limits_falls_back_to_jobspec_defaults():
+    # Backwards compatibility: a worker must stay usable against a backend
+    # deployed before this field existed. Returning {} (rather than an
+    # explicit None) is what lets JobSpec's own defaults apply.
+    assert _resource_limits({"image": "alpine:3.20"}) == {}
+
+
+def test_a_request_larger_than_the_machine_can_spare_is_capped(monkeypatch, caplog):
+    # The advertised figure is TOTAL physical RAM, so honouring it literally
+    # would leave nothing for the provider's OS, Docker, or this worker.
+    import nodeva_worker.link as link_module
+    monkeypatch.setattr(link_module, "detect_ram_mb", lambda: 8192)
+
+    with caplog.at_level(logging.WARNING):
+        limits = _resource_limits({"memory_mb": 8192})
+
+    assert limits["memory_mb"] == 7168, "8192 total minus 1024 headroom"
+    # Capping silently would hide a node advertising more than it can
+    # deliver -- the provider's own listing to correct.
+    assert "advertised ram_mb is too high" in caplog.text
+
+
+def test_a_request_within_the_machine_s_capacity_is_left_alone(monkeypatch):
+    import nodeva_worker.link as link_module
+    monkeypatch.setattr(link_module, "detect_ram_mb", lambda: 32768)
+    assert _resource_limits({"memory_mb": 4096})["memory_mb"] == 4096
+
+
+def test_an_undetectable_machine_total_does_not_block_the_job(monkeypatch):
+    # detect_ram_mb() honestly returns None on a platform it can't measure
+    # (Windows has no sysconf -- see hardware.py). That must not silently
+    # zero out the limit and make every job unrunnable.
+    import nodeva_worker.link as link_module
+    monkeypatch.setattr(link_module, "detect_ram_mb", lambda: None)
+    assert _resource_limits({"memory_mb": 4096})["memory_mb"] == 4096
+
+
+def test_the_limits_actually_reach_the_container_spec(link, monkeypatch):
+    # The wiring test, not the logic test: _resource_limits() can be
+    # perfectly correct and still never be PASSED to JobSpec, which is
+    # exactly the bug this whole change fixes. Captures the real JobSpec
+    # _run_and_report builds and hands to run_job.
+    import nodeva_worker.link as link_module
+    monkeypatch.setattr(link_module, "detect_ram_mb", lambda: 65536)
+
+    captured = {}
+
+    def fake_run_job(spec):
+        captured["spec"] = spec
+        return JobResult(status="succeeded", exit_code=0, stdout="", stderr="",
+                         duration_seconds=1)
+
+    monkeypatch.setattr(link_module, "run_job", fake_run_job)
+
+    ws = FakeWs()
+    run(link._run_and_report(ws, "job-1", {
+        "image": "alpine:3.20", "command": ["true"],
+        "memory_mb": 32768, "cpus": 16,
+    }))
+
+    assert captured["spec"].memory_mb == 32768
+    assert captured["spec"].cpus == 16.0
+
+
+def test_a_job_with_no_limits_still_reaches_the_container_at_jobspec_defaults(link, monkeypatch):
+    import nodeva_worker.link as link_module
+    captured = {}
+
+    def fake_run_job(spec):
+        captured["spec"] = spec
+        return JobResult(status="succeeded", exit_code=0, stdout="", stderr="",
+                         duration_seconds=1)
+
+    monkeypatch.setattr(link_module, "run_job", fake_run_job)
+
+    ws = FakeWs()
+    run(link._run_and_report(ws, "job-1", {"image": "alpine:3.20", "command": ["true"]}))
+
+    assert captured["spec"].memory_mb == 2048
+    assert captured["spec"].cpus == 2.0

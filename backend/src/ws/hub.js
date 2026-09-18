@@ -213,12 +213,17 @@ export class Hub {
   /** Submit a job for a confirmed reservation. Resolves once the node
    * acknowledges (container started or rejected) -- NOT when the job
    * finishes. The eventual outcome arrives later via onJobResult. */
-  submitJob(nodeId, { jobId, reservationId, image, command, env, gpu }) {
+  submitJob(nodeId, { jobId, reservationId, image, command, env, gpu, memoryMb, cpus }) {
     const conn = this._nodes.get(nodeId);
     if (!conn) return Promise.reject(new NodeOffline(nodeId));
     return this._sendAwait(conn.socket, jobId, this._jobAckTimeoutMs, {
       type: TYPE.JOB_SUBMIT, job_id: jobId, reservation_id: reservationId,
       image, command, env: env ?? {}, gpu: gpu ?? [],
+      // The reserved node's own advertised specs. Omitted (rather than sent
+      // as null) when unknown, so the worker falls back to JobSpec's
+      // defaults exactly as it did before these were wired through.
+      ...(memoryMb ? { memory_mb: memoryMb } : {}),
+      ...(cpus ? { cpus } : {}),
     }).then((msg) => {
       if (msg.type === TYPE.JOB_REJECTED) throw new NodeRefused(msg.reason);
       return msg; // JOB_ACCEPTED

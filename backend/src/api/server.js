@@ -1090,6 +1090,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
       try {
         await hub.submitJob(resv.node_id, {
           jobId, reservationId: resv.reservation_id, image, command, env, gpu,
+          ...(await nodeJobLimits(pool, resv.node_id)),
         });
       } catch (e) {
         if (e instanceof NodeOffline) return res.status(409).json({ error: 'node_offline' });
@@ -1117,6 +1118,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
         try {
           await hub.submitJob(sibling.node_id, {
             jobId: siblingJobId, reservationId: sibling.reservation_id, image, command, env, gpu,
+            ...(await nodeJobLimits(pool, sibling.node_id)),
           });
           await pool.query(
             `INSERT INTO jobs (job_id, reservation_id, image, command, status, started_at, verification_group_id)
@@ -1221,6 +1223,7 @@ export function createApp(pool, { paymentGateway, emailSender } = {}) {
       try {
         await hub.submitJob(tiebreakerResv.node_id, {
           jobId, reservationId: tiebreakerResv.reservation_id, image, command,
+          ...(await nodeJobLimits(pool, tiebreakerResv.node_id)),
         });
       } catch (e) {
         if (e instanceof NodeOffline) return res.status(409).json({ error: 'node_offline' });
@@ -1457,6 +1460,24 @@ async function providerIdForNode(client, nodeId) {
   const { rows } = await client.query(
     'SELECT provider_id FROM compute_nodes WHERE node_id = $1', [nodeId]);
   return rows[0]?.provider_id ?? null;
+}
+
+// The resource ceiling a job on this node gets: exactly what the node
+// advertises, which is what /search filtered on and what the booking was
+// priced from. Without this, hub.submitJob sent no limits at all and every
+// job -- on every node, however large -- ran at the worker's JobSpec
+// defaults of 2048MB and 2 cores, making ram_mb/cpu_cores decorative
+// fields the marketplace sold but never delivered.
+//
+// Sent as-advertised rather than pre-shaved for the provider's own OS
+// headroom: the worker applies that clamp itself (link.py's
+// _resource_limits), since only it knows the machine's real total, and a
+// listing that overstates what its machine can spare is a mismatch worth
+// surfacing there rather than silently absorbing here.
+async function nodeJobLimits(client, nodeId) {
+  const { rows } = await client.query(
+    'SELECT ram_mb, cpu_cores FROM compute_nodes WHERE node_id = $1', [nodeId]);
+  return { memoryMb: rows[0]?.ram_mb ?? null, cpus: rows[0]?.cpu_cores ?? null };
 }
 
 // The settlement side of duplicate-execution verification

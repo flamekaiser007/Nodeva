@@ -165,6 +165,19 @@ def describe_this_machine() -> dict:
     }
 
 
+def offerable_memory_mb(total_mb: int, headroom_mb: int = 1024) -> int:
+    """RAM we can hand to a job container, given this machine's total.
+
+    The same reasoning as offerable_vram_mb below, for system memory: the
+    provider's own OS, the Docker daemon, and this worker process all live
+    in that total. A node enrolls advertising what detect_ram_mb() reports,
+    which is TOTAL physical RAM -- handing 100% of it to a container does
+    not give the buyer more, it just makes the machine thrash and start
+    OOM-killing things (possibly this worker, losing the job anyway).
+    """
+    return max(0, total_mb - headroom_mb)
+
+
 def offerable_vram_mb(gpu: GpuInfo, headroom_mb: int = 1024) -> int:
     """VRAM we can honestly advertise.
 
