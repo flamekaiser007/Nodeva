@@ -23,6 +23,7 @@ crash; the platform sees a normal disconnect and marks the node offline.
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -47,8 +48,17 @@ def parse_args(argv=None):
                          help="Must match the price you enrolled this node with -- the RECEIPT this "
                               "worker signs for a booking includes it, and a mismatch fails verification "
                               "on the platform side (admitReceipt, backend/src/api/server.js).")
-    parser.add_argument("--url", default="ws://localhost:3100/worker",
-                         help="The platform's WebSocket URL (default: a local dev backend).")
+    # The default is a LOCAL dev backend, which is silently wrong the moment a
+    # provider's node lives on a deployed one: the worker connects to the
+    # wrong platform, whose database has never heard of that node_id, and the
+    # handshake is refused. Reading NODEVA_URL lets a provider set their real
+    # backend once (a shell profile, a .env) instead of remembering the flag
+    # on every run -- an explicit --url still wins over it.
+    parser.add_argument("--url",
+                         default=os.environ.get("NODEVA_URL", "ws://localhost:3100/worker"),
+                         help="The platform's WebSocket URL, e.g. "
+                              "wss://your-backend.example.com/worker. Defaults to $NODEVA_URL "
+                              "if set, otherwise a local dev backend.")
     parser.add_argument("--identity-path", default=str(Path.home() / ".nodeva" / "node.pem"),
                          help="Must match the identity you enrolled with -- the same file the "
                               "enrollment snippet created.")

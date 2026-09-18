@@ -88,6 +88,19 @@ local dev default:
   --url wss://nodeva-backend-xxxx.onrender.com/worker
 ```
 
+`--url` defaults to a LOCAL dev backend, which is the single easiest thing
+to get wrong here: omit it against a deployed platform and the worker
+connects to localhost instead, whose database has never heard of that
+node_id, and the handshake is refused (`does not recognise node ...`). Set
+it once instead of remembering the flag every run:
+
+```bash
+export NODEVA_URL=wss://nodeva-backend-xxxx.onrender.com/worker
+```
+
+An explicit `--url` still overrides it, so a provider can point a worker at
+a local backend for testing without unsetting anything.
+
 (`wss://`, not `ws://` -- Render terminates TLS for you, and the browser's
 own WebSocket connection to `/worker` needs to match the page's own
 `https://` origin's security level.)

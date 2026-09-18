@@ -66,3 +66,31 @@ def test_peer_port_is_off_by_default_but_wired_through_when_given(tmp_path):
     link = build_link(args)
     assert link.peer_port == 41000
     assert link._peer_server is not None
+
+
+# --- $NODEVA_URL --------------------------------------------------------
+# The --url default is a LOCAL dev backend, which is silently wrong once a
+# node lives on a deployed one: the worker connects to a platform whose
+# database has never heard of that node_id and the handshake is refused.
+# Caught live, three times over, by a provider re-running a remembered
+# command without the flag.
+
+def test_the_url_defaults_to_the_local_dev_backend(monkeypatch):
+    monkeypatch.delenv("NODEVA_URL", raising=False)
+    args = parse_args(["--node-id", "n1", "--price-paise-hr", "4300"])
+    assert args.url == "ws://localhost:3100/worker"
+
+
+def test_nodeva_url_sets_the_default_so_the_flag_can_be_omitted(monkeypatch):
+    monkeypatch.setenv("NODEVA_URL", "wss://deployed.example.com/worker")
+    args = parse_args(["--node-id", "n1", "--price-paise-hr", "4300"])
+    assert args.url == "wss://deployed.example.com/worker"
+
+
+def test_an_explicit_url_still_beats_the_environment(monkeypatch):
+    monkeypatch.setenv("NODEVA_URL", "wss://deployed.example.com/worker")
+    args = parse_args([
+        "--node-id", "n1", "--price-paise-hr", "4300",
+        "--url", "ws://localhost:3100/worker",
+    ])
+    assert args.url == "ws://localhost:3100/worker"
