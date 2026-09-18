@@ -191,3 +191,111 @@ test('the catalogue is ordered cheapest first', { skip }, async () => {
   const prices = (await catalogue()).map((n) => n.price_paise_hr);
   assert.deepEqual(prices, [...prices].sort((a, b) => a - b));
 });
+
+// --- already-booked time -------------------------------------------------
+// node_availability is what a provider SAYS is free and is never amended when
+// a booking lands on it. Advertising it raw offers time that is already sold:
+// the user only finds out when reservations' EXCLUDE constraint refuses the
+// booking. These prove the catalogue subtracts real bookings.
+
+/** A confirmed booking on `nodeId`, inserted directly -- no worker needed. */
+async function book(nodeId, startMs, endMs, status = 'confirmed') {
+  const buyer = await json(await fetch(`${base}/auth/signup`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      email: `browse-buyer-${crypto.randomUUID()}@test.local`,
+      password: 'correct horse battery staple', display_name: 'Browse Buyer',
+    }),
+  }));
+  await pool.query(
+    `INSERT INTO reservations
+       (reservation_id, node_id, user_id, slot, price_paise_hr, quoted_paise, status)
+     VALUES ($1,$2,$3, tstzrange($4,$5), 4300, 4300, $6)`,
+    [crypto.randomUUID(), nodeId, buyer.user.id, new Date(startMs), new Date(endMs), status]);
+}
+
+const HOUR = 3_600_000;
+
+/** Enrolls an online node with one window of `hours`, as its real owner. */
+async function nodeWithWindow(start, hours) {
+  const { node_id, auth } = await enrollNode({ availability: false });
+  const res = await fetch(`${base}/nodes/${node_id}/availability`, {
+    method: 'POST', headers: { ...authed(auth.token), 'content-type': 'application/json' },
+    body: JSON.stringify({ window_start: start, window_end: start + hours * HOUR }),
+  });
+  assert.equal(res.status, 201, 'availability window must have been created');
+  return node_id;
+}
+
+test('a booking inside a window splits it, keeping the free time either side', { skip }, async () => {
+  const start = Date.now() + HOUR;
+  const node_id = await nodeWithWindow(start, 8);
+  await book(node_id, start + 3 * HOUR, start + 4 * HOUR);
+
+  const mine = (await catalogue()).find((n) => n.id === node_id);
+  assert.ok(mine, 'still listed -- it has free time either side of the booking');
+  assert.equal(mine.availability.length, 2, 'the booked hour splits the window in two');
+  assert.equal(mine.availability[0].end, start + 3 * HOUR, 'free time ends where the booking starts');
+  assert.equal(mine.availability[1].start, start + 4 * HOUR, 'and resumes when it ends');
+});
+
+test('a fully booked node drops out of the catalogue entirely', { skip }, async () => {
+  const start = Date.now() + HOUR;
+  const node_id = await nodeWithWindow(start, 2);
+  assert.ok(idsIn(await catalogue()).includes(node_id), 'listed while free');
+
+  await book(node_id, start, start + 2 * HOUR);
+
+  assert.ok(!idsIn(await catalogue()).includes(node_id),
+    'every advertised hour is sold -- listing it would offer nothing buyable');
+});
+
+test('a pending booking does not fence off the slot', { skip }, async () => {
+  // 'pending' means we intend to book and the node has not locked anything
+  // yet -- it is absent from reservations' own EXCLUDE constraint too. If it
+  // blocked here, an abandoned checkout would quietly remove a provider's
+  // time from sale with nothing ever holding it.
+  const start = Date.now() + HOUR;
+  const node_id = await nodeWithWindow(start, 2);
+  await book(node_id, start, start + 2 * HOUR, 'pending');
+
+  const mine = (await catalogue()).find((n) => n.id === node_id);
+  assert.ok(mine, 'still bookable');
+  assert.equal(mine.availability.length, 1);
+});
+
+test('a cancelled booking releases its time back to the catalogue', { skip }, async () => {
+  const start = Date.now() + HOUR;
+  const node_id = await nodeWithWindow(start, 2);
+  await book(node_id, start, start + 2 * HOUR, 'cancelled');
+
+  const mine = (await catalogue()).find((n) => n.id === node_id);
+  assert.ok(mine, 'a cancelled booking holds nothing');
+  assert.equal(mine.availability.length, 1);
+});
+
+test('search will not offer a node whose slot is already booked', { skip }, async () => {
+  // Same correction, on the other query. Before this, /search matched the
+  // request against the provider's declared window and the booking then
+  // failed on reservations' EXCLUDE constraint -- available right up until
+  // it wasn't.
+  const start = Date.now() + HOUR;
+  const node_id = await nodeWithWindow(start, 4);
+
+  const search = async () => json(await fetch(`${base}/search`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      min_vram_mb: 1024, min_cpu_cores: 1, min_ram_mb: 1024,
+      starts_at: start + HOUR, ends_at: start + 2 * HOUR,
+    }),
+  }));
+
+  const before = await search();
+  assert.ok(before.results.some((r) => r.node.id === node_id), 'offered while free');
+
+  await book(node_id, start + HOUR, start + 2 * HOUR);
+
+  const after = await search();
+  assert.ok(!after.results.some((r) => r.node.id === node_id),
+    'that exact hour is sold, so it must no longer be a search result');
+});

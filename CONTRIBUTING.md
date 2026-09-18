@@ -70,10 +70,10 @@ unset in local dev -- see `docs/payment-architecture.md` and
 ## Running the tests
 
 ```bash
-# backend (293 tests as of this writing; several suites need Postgres and
+# backend (331 tests as of this writing; several suites need Postgres and
 # skip cleanly without it -- see the comment block in README.md's own
 # "Running" section for exactly which)
-cd backend && node --test test/*.test.js
+cd backend && npm test
 
 # worker (59 tests; some need a real GPU or network access and skip
 # cleanly without either)
@@ -88,6 +88,18 @@ cd frontend && npm test
 npx playwright install chromium   # once
 ./e2e/run_e2e.sh
 ```
+
+`npm test` runs the backend suite with `--test-concurrency=1`, which is
+slower (about 100s instead of 20s) and deliberate. These suites share ONE
+Postgres, and several of the functions they exercise are global sweeps by
+design -- `processRefundRetries` and `reconcileExpiredMismatches` both scan
+the whole table with a `LIMIT` rather than filtering to one caller's rows,
+because that is what a real deployment needs. Two such files running
+concurrently therefore consume each other's rows and each other's batch
+limits, producing failures that have nothing to do with the code under
+test. Three separate tests were patched for this before the pattern was
+worth naming; serializing removes the whole class instead of the next
+instance of it.
 
 ## The live-verification scripts
 

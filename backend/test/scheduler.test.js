@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rank, feasible, coversWindow, expectedCostPaise } from '../src/marketplace/scheduler.js';
+import { rank, feasible, coversWindow, expectedCostPaise, subtractBusy } from '../src/marketplace/scheduler.js';
 
 const T = (s) => new Date(`2026-09-20T${s}:00+05:30`).getTime();
 
@@ -100,4 +100,96 @@ test('the recommendation is per-candidate, not a single value applied to the who
   const byId = Object.fromEntries(results.map((r) => [r.node.id, r]));
   assert.equal(byId.trusted.verification_recommended, false);
   assert.equal(byId.newOne.verification_recommended, true);
+});
+
+// --- subtractBusy --------------------------------------------------------
+// node_availability records when a provider SAYS the machine is free and is
+// never amended when a booking lands on it, so advertising those windows raw
+// offers time that is already sold. These are the shapes that matter.
+
+test('a booking in the middle of a window leaves the free time on BOTH sides', () => {
+  // Dropping the whole window would hide two genuinely bookable stretches.
+  const free = subtractBusy(
+    [{ start: T('09:00'), end: T('17:00') }],
+    [{ start: T('12:00'), end: T('13:00') }]);
+
+  assert.deepEqual(free, [
+    { start: T('09:00'), end: T('12:00') },
+    { start: T('13:00'), end: T('17:00') },
+  ]);
+});
+
+test('a window booked end to end disappears rather than being advertised', () => {
+  const free = subtractBusy(
+    [{ start: T('09:00'), end: T('10:00') }],
+    [{ start: T('09:00'), end: T('10:00') }]);
+  assert.deepEqual(free, []);
+});
+
+test('a booking overlapping only the start trims the front', () => {
+  const free = subtractBusy(
+    [{ start: T('09:00'), end: T('12:00') }],
+    [{ start: T('08:00'), end: T('10:00') }]);
+  assert.deepEqual(free, [{ start: T('10:00'), end: T('12:00') }]);
+});
+
+test('a booking on another day leaves the window untouched', () => {
+  const windows = [{ start: T('09:00'), end: T('12:00') }];
+  assert.deepEqual(subtractBusy(windows, [{ start: T('14:00'), end: T('15:00') }]), windows);
+});
+
+test('overlapping bookings do not reopen time between them', () => {
+  // A completed booking and a held one can overlap or nest. Walking them
+  // naively would let the cursor move BACKWARDS and emit a free slot that
+  // is actually sold.
+  const free = subtractBusy(
+    [{ start: T('09:00'), end: T('17:00') }],
+    [
+      { start: T('10:00'), end: T('14:00') },
+      { start: T('11:00'), end: T('12:00') }, // nested inside the first
+      { start: T('13:00'), end: T('15:00') }, // overlaps the first
+    ]);
+  assert.deepEqual(free, [
+    { start: T('09:00'), end: T('10:00') },
+    { start: T('15:00'), end: T('17:00') },
+  ]);
+});
+
+test('bookings are handled in any order, not just sorted', () => {
+  const free = subtractBusy(
+    [{ start: T('09:00'), end: T('17:00') }],
+    [
+      { start: T('15:00'), end: T('16:00') },
+      { start: T('10:00'), end: T('11:00') },
+    ]);
+  assert.deepEqual(free, [
+    { start: T('09:00'), end: T('10:00') },
+    { start: T('11:00'), end: T('15:00') },
+    { start: T('16:00'), end: T('17:00') },
+  ]);
+});
+
+test('an abutting booking is not an overlap and changes nothing', () => {
+  // Ends exactly when the window starts. Treating touching as overlapping
+  // would shave real time off every back-to-back booking.
+  const windows = [{ start: T('10:00'), end: T('12:00') }];
+  assert.deepEqual(subtractBusy(windows, [{ start: T('09:00'), end: T('10:00') }]), windows);
+});
+
+test('no bookings returns the windows unchanged', () => {
+  const windows = [{ start: T('09:00'), end: T('12:00') }];
+  assert.deepEqual(subtractBusy(windows, []), windows);
+  assert.deepEqual(subtractBusy(windows, undefined), windows);
+});
+
+test('a request spanning a booking is no longer feasible', () => {
+  // The point of all of this: coversWindow needs ONE window containing the
+  // request, and splitting means a request straddling a booking finds none.
+  const windows = subtractBusy(
+    [{ start: T('09:00'), end: T('17:00') }],
+    [{ start: T('10:30'), end: T('11:30') }]);
+
+  assert.equal(coversWindow(windows, T('10:00'), T('12:00')), false, 'straddles the booking');
+  assert.equal(coversWindow(windows, T('09:00'), T('10:00')), true, 'fits before it');
+  assert.equal(coversWindow(windows, T('11:30'), T('13:00')), true, 'fits after it');
 });

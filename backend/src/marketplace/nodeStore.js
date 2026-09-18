@@ -1,9 +1,38 @@
+import { subtractBusy } from './scheduler.js';
+
 // Postgres-backed view of compute_nodes, joined with live hub presence.
 //
 // Reiterating the design boundary: this is a SEARCH INDEX. `status='online'`
 // here means "the node's last heartbeat said so", not "the node is reachable
 // right now" — the hub's in-memory presence is closer to ground truth than
 // this column is, which is why searchCandidates cross-checks both.
+
+// Time already sold on these nodes, so it can be removed from what we
+// advertise. The status set is not a judgement call: it is exactly the set
+// reservations' own EXCLUDE constraint refuses to double-book
+// (migrations/001_init.sql), so the catalogue offers precisely what the
+// database would actually accept a booking for. 'pending' is absent there
+// and here alike -- the node has not locked that slot yet, and holding it
+// against everyone else on the strength of an intent would let a
+// never-completed booking quietly fence off a provider's whole day.
+async function busySlotsByNode(pool, nodeIds, from) {
+  if (!nodeIds.length) return new Map();
+  const { rows } = await pool.query(
+    `SELECT node_id, lower(slot) AS starts_at, upper(slot) AS ends_at
+       FROM reservations
+      WHERE node_id = ANY($1::uuid[])
+        AND status IN ('held','confirmed','running','completed')
+        AND upper(slot) >= $2`,
+    [nodeIds, from]);
+
+  const byNode = new Map();
+  for (const r of rows) {
+    const list = byNode.get(r.node_id) ?? [];
+    list.push({ start: r.starts_at.getTime(), end: r.ends_at.getTime() });
+    byNode.set(r.node_id, list);
+  }
+  return byNode;
+}
 
 /**
  * Everything a buyer could actually rent right now, with no requirements to
@@ -38,11 +67,20 @@ export async function browseCatalogue(pool, hub, { now = new Date() } = {}) {
       )
     : { rows: [] };
 
+  const busyByNode = await busySlotsByNode(pool, nodeIds, now);
+
   const windowsByNode = new Map();
   for (const a of availability.rows) {
     const list = windowsByNode.get(a.node_id) ?? [];
     list.push({ start: a.window_start.getTime(), end: a.window_end.getTime() });
     windowsByNode.set(a.node_id, list);
+  }
+  // What is left after existing bookings -- a node whose declared windows are
+  // entirely sold has nothing to advertise and drops out below.
+  for (const [nodeId, windows] of windowsByNode) {
+    const free = subtractBusy(windows, busyByNode.get(nodeId));
+    if (free.length) windowsByNode.set(nodeId, free);
+    else windowsByNode.delete(nodeId);
   }
 
   return rows
@@ -93,11 +131,20 @@ export async function searchCandidates(pool, hub, req) {
       )
     : { rows: [] };
 
+  const busyByNode = await busySlotsByNode(pool, nodeIds, new Date(req.starts_at));
+
   const windowsByNode = new Map();
   for (const a of availability.rows) {
     const list = windowsByNode.get(a.node_id) ?? [];
     list.push({ start: a.window_start.getTime(), end: a.window_end.getTime() });
     windowsByNode.set(a.node_id, list);
+  }
+  // Same correction as browseCatalogue: a window with a booking already in it
+  // is not free time. Without this, feasible()/coversWindow would match a
+  // request against a slot that reservations' EXCLUDE constraint then
+  // refuses -- the node looks available right up until booking fails.
+  for (const [nodeId, windows] of windowsByNode) {
+    windowsByNode.set(nodeId, subtractBusy(windows, busyByNode.get(nodeId)));
   }
 
   return rows

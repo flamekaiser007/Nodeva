@@ -39,6 +39,46 @@ export function coversWindow(windows, startsAt, endsAt) {
   return windows.some(w => w.start <= startsAt && w.end >= endsAt);
 }
 
+/**
+ * The parts of a provider's declared windows that are not already booked.
+ *
+ * node_availability records when a provider SAYS the machine is free; it is
+ * never amended when a booking lands on it. Advertising those windows raw
+ * therefore offers time that is already sold -- a user only discovers the
+ * clash when their reservation is refused, and the more traffic a node has,
+ * the more of its advertised time is fiction.
+ *
+ * Splitting rather than dropping matters: a booking in the middle of a
+ * window leaves genuinely free time on both sides, and dropping the whole
+ * window would hide it. The result is the same shape as the input, so
+ * coversWindow's rule above still applies unchanged -- and correctly, since
+ * a request spanning a booking now finds no single window containing it.
+ *
+ * `busy` need not be sorted or disjoint.
+ */
+export function subtractBusy(windows, busy) {
+  if (!busy?.length) return windows;
+
+  return windows.flatMap((w) => {
+    // Only the bookings that actually touch this window, earliest first.
+    const overlapping = busy
+      .filter((b) => b.start < w.end && b.end > w.start)
+      .sort((a, b) => a.start - b.start);
+
+    const free = [];
+    let cursor = w.start;
+    for (const b of overlapping) {
+      if (b.start > cursor) free.push({ start: cursor, end: b.start });
+      // max(): bookings can overlap each other (a completed one and a held
+      // one can abut or nest), so the cursor must never move backwards.
+      cursor = Math.max(cursor, b.end);
+      if (cursor >= w.end) break;
+    }
+    if (cursor < w.end) free.push({ start: cursor, end: w.end });
+    return free;
+  });
+}
+
 // Reliability-adjusted cost. A node at ₹35/hr that fails 20% of the time costs
 // more in expectation than one at ₹40/hr that never fails, because a failure
 // means re-running the job somewhere else. Ranking on sticker price alone
